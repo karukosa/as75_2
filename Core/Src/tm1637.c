@@ -102,6 +102,10 @@ void tm1637DisplayDecimalTenths(TM1637Handle *handle, int valueTenths)
         }
     }
 
+    /* Light decimal point between integer and tenths.
+       Some TM1637 modules map the separator to digit 1 instead of digit 2,
+       so set both bits to ensure the dot is visible. */
+    segments[1] |= 1U << 7;
     segments[2] |= 1U << 7;
     tm1637WriteSegments(handle, segments);
 }

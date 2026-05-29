@@ -24,16 +24,34 @@
 /* USER CODE BEGIN Includes */
 #include "max31865.h"
 #include "tm1637.h"
+#include "button_input.h"
 
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct {
+  uint16_t temperatureTenthsC;
+  uint16_t sterilizeMinutes;
+  uint16_t dryMinutes;
+} ProgramConfig;
+
+typedef struct {
+  GPIO_TypeDef *port;
+  uint16_t pin;
+} GpioOutput;
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define PROGRAM_COUNT 6U
+#define PROGRAM_NONE 0xffU
+#define PROGRAM_DEBOUNCE_MS 30U
+#define PROGRAM_LONG_PRESS_MS 1000U
+#define PROGRAM_REPEAT_MS 500U
+#define PROGRAM_TIME_ALTERNATE_MS 2000U
+#define TEMPERATURE_REFRESH_MS 300U
 
 /* USER CODE END PD */
 
@@ -47,9 +65,26 @@ SPI_HandleTypeDef hspi3;
 
 /* USER CODE BEGIN PV */
 Max31865Handle gMax31865;
+TM1637Handle gDisplay1;
 TM1637Handle gDisplay2;
+ButtonInput gProgramButtons[PROGRAM_COUNT];
 int16_t gTemperatureTenthsC = 0;
 uint8_t gSensorReady = 0U;
+uint8_t gSelectedProgram = PROGRAM_NONE;
+uint8_t gProgramTimeDisplayPhase = 0xffU;
+uint32_t gProgramSelectedTick = 0U;
+uint32_t gLastTemperatureReadTick = 0U;
+
+static const ProgramConfig programPresets[PROGRAM_COUNT] = {
+  {1210U, 15U, 0U}, {1210U, 20U, 15U}, {1320U, 7U, 10U},
+  {1340U, 7U, 10U}, {1340U, 10U, 20U}, {1340U, 5U, 5U}
+};
+
+static const GpioOutput programLeds[PROGRAM_COUNT] = {
+  {LD_P1_GPIO_Port, LD_P1_Pin}, {LD_P2_GPIO_Port, LD_P2_Pin},
+  {LD_P3_GPIO_Port, LD_P3_Pin}, {LD_P4_GPIO_Port, LD_P4_Pin},
+  {LD_P5_GPIO_Port, LD_P5_Pin}, {LD_P6_GPIO_Port, LD_P6_Pin}
+};
 
 /* USER CODE END PV */
 
@@ -61,6 +96,13 @@ void MX_USB_HOST_Process(void);
 
 /* USER CODE BEGIN PFP */
 static void DisplayErrorOnDisplay2(uint8_t code);
+static void ProgramButtons_Init(void);
+static void ProgramButtons_Process(uint32_t now);
+static void Program_Select(uint8_t programIndex, uint32_t now);
+static void ProgramLeds_Set(uint8_t programIndex);
+static void ProgramDisplay_Update(uint32_t now);
+static void DisplayProgramTime(TM1637Handle *display, const char prefix[2], uint16_t minutes);
+static void TemperatureDisplay_Process(uint32_t now);
 
 /* USER CODE END PFP */
 
@@ -68,11 +110,140 @@ static void DisplayErrorOnDisplay2(uint8_t code);
 /* USER CODE BEGIN 0 */
 static void DisplayErrorOnDisplay2(uint8_t code)
 {
-  /* E r r <code> */
-  uint8_t segments[4] = {0x79U, 0x50U, 0x50U, 0x00U};
+  /* E r <tens><ones> (e.g. Er01 for PT100 read failure). */
+  uint8_t segments[4] = {0x79U, 0x50U, 0x00U, 0x00U};
   static const uint8_t digitMap[10] = {0x3fU, 0x06U, 0x5bU, 0x4fU, 0x66U, 0x6dU, 0x7dU, 0x07U, 0x7fU, 0x6fU};
-  segments[3] = digitMap[code % 10U];
+  uint8_t normalizedCode = (uint8_t)(code % 100U);
+  segments[2] = digitMap[normalizedCode / 10U];
+  segments[3] = digitMap[normalizedCode % 10U];
   tm1637DisplaySegments(&gDisplay2, segments);
+}
+
+static uint8_t SegmentForCharacter(char character)
+{
+  switch (character) {
+    case '0': return 0x3fU;
+    case '1': return 0x06U;
+    case '2': return 0x5bU;
+    case '3': return 0x4fU;
+    case '4': return 0x66U;
+    case '5': return 0x6dU;
+    case '6': return 0x7dU;
+    case '7': return 0x07U;
+    case '8': return 0x7fU;
+    case '9': return 0x6fU;
+    case 'D': return 0x5eU;
+    case 'S': return 0x6dU;
+    case 'r': return 0x50U;
+    case 't': return 0x78U;
+    default: return 0x00U;
+  }
+}
+
+static void ProgramButtons_Init(void)
+{
+  ButtonInput_Init(&gProgramButtons[0], B_P1_GPIO_Port, B_P1_Pin, GPIO_PIN_SET);
+  ButtonInput_Init(&gProgramButtons[1], B_P2_GPIO_Port, B_P2_Pin, GPIO_PIN_SET);
+  ButtonInput_Init(&gProgramButtons[2], B_P3_GPIO_Port, B_P3_Pin, GPIO_PIN_SET);
+  ButtonInput_Init(&gProgramButtons[3], B_P4_GPIO_Port, B_P4_Pin, GPIO_PIN_SET);
+  ButtonInput_Init(&gProgramButtons[4], B_P5_GPIO_Port, B_P5_Pin, GPIO_PIN_SET);
+  ButtonInput_Init(&gProgramButtons[5], B_P6_GPIO_Port, B_P6_Pin, GPIO_PIN_SET);
+}
+
+static void ProgramButtons_Process(uint32_t now)
+{
+  for (uint8_t i = 0U; i < PROGRAM_COUNT; ++i) {
+    ButtonInput_Update(&gProgramButtons[i], now, PROGRAM_DEBOUNCE_MS, PROGRAM_LONG_PRESS_MS, PROGRAM_REPEAT_MS);
+    if (ButtonInput_ConsumePressed(&gProgramButtons[i]) != 0U) {
+      Program_Select(i, now);
+    }
+  }
+}
+
+static void Program_Select(uint8_t programIndex, uint32_t now)
+{
+  if (programIndex >= PROGRAM_COUNT) {
+    return;
+  }
+
+  gSelectedProgram = programIndex;
+  gProgramSelectedTick = now;
+  gProgramTimeDisplayPhase = 0xffU;
+  ProgramLeds_Set(programIndex);
+  ProgramDisplay_Update(now);
+  tm1637DisplayDecimalTenths(&gDisplay2, programPresets[programIndex].temperatureTenthsC);
+}
+
+static void ProgramLeds_Set(uint8_t programIndex)
+{
+  for (uint8_t i = 0U; i < PROGRAM_COUNT; ++i) {
+    HAL_GPIO_WritePin(programLeds[i].port, programLeds[i].pin, GPIO_PIN_RESET);
+  }
+
+  if (programIndex < PROGRAM_COUNT) {
+    HAL_GPIO_WritePin(programLeds[programIndex].port, programLeds[programIndex].pin, GPIO_PIN_SET);
+  }
+}
+
+static void ProgramDisplay_Update(uint32_t now)
+{
+  uint8_t phase;
+  const ProgramConfig *program;
+
+  if (gSelectedProgram >= PROGRAM_COUNT) {
+    return;
+  }
+
+  phase = (uint8_t)(((now - gProgramSelectedTick) / PROGRAM_TIME_ALTERNATE_MS) & 0x01U);
+  if (phase == gProgramTimeDisplayPhase) {
+    return;
+  }
+
+  gProgramTimeDisplayPhase = phase;
+  program = &programPresets[gSelectedProgram];
+
+  if (phase == 0U) {
+    DisplayProgramTime(&gDisplay1, "St", program->sterilizeMinutes);
+  }
+  else {
+    DisplayProgramTime(&gDisplay1, "Dr", program->dryMinutes);
+  }
+}
+
+static void DisplayProgramTime(TM1637Handle *display, const char prefix[2], uint16_t minutes)
+{
+  uint8_t segments[4];
+
+  if (minutes > 99U) {
+    minutes = 99U;
+  }
+
+  segments[0] = SegmentForCharacter(prefix[0]);
+  segments[1] = SegmentForCharacter(prefix[1]) | (1U << 7);
+  segments[2] = SegmentForCharacter((char)('0' + ((minutes / 10U) % 10U)));
+  segments[3] = SegmentForCharacter((char)('0' + (minutes % 10U)));
+  tm1637DisplaySegments(display, segments);
+}
+
+static void TemperatureDisplay_Process(uint32_t now)
+{
+  if ((now - gLastTemperatureReadTick) < TEMPERATURE_REFRESH_MS) {
+    return;
+  }
+
+  gLastTemperatureReadTick = now;
+  if (gSelectedProgram != PROGRAM_NONE) {
+    return;
+  }
+
+  if (gSensorReady != 0U) {
+    if (Max31865_ReadTemperatureTenthsC(&gMax31865, &gTemperatureTenthsC) != 0U) {
+      tm1637DisplayDecimalTenths(&gDisplay2, gTemperatureTenthsC);
+    }
+    else {
+      DisplayErrorOnDisplay2(Max31865_ReadFault(&gMax31865, MAX31865_FAULT_NONE));
+    }
+  }
 }
 
 /* USER CODE END 0 */
@@ -108,9 +279,14 @@ int main(void)
   MX_USB_HOST_Init();
   MX_SPI3_Init();
   /* USER CODE BEGIN 2 */
+  tm1637Init(&gDisplay1, TM1637_DISPLAY_1);
   tm1637Init(&gDisplay2, TM1637_DISPLAY_2);
+  tm1637SetBrightness(&gDisplay1, 8);
   tm1637SetBrightness(&gDisplay2, 8);
+  tm1637Clear(&gDisplay1);
   tm1637Clear(&gDisplay2);
+  ProgramButtons_Init();
+  ProgramLeds_Set(PROGRAM_NONE);
 
   Max31865_Init(&gMax31865, &hspi3, CS_GPIO_Port, CS_Pin, 430.0f, 100.0f);
   gSensorReady = Max31865_Begin(&gMax31865, MAX31865_2WIRE, 1U);
@@ -128,15 +304,12 @@ int main(void)
     MX_USB_HOST_Process();
 
     /* USER CODE BEGIN 3 */
-    if (gSensorReady != 0U) {
-           if (Max31865_ReadTemperatureTenthsC(&gMax31865, &gTemperatureTenthsC) != 0U) {
-               tm1637DisplayDecimalTenths(&gDisplay2, gTemperatureTenthsC);
-           }
-           else {
-               DisplayErrorOnDisplay2(Max31865_ReadFault(&gMax31865, MAX31865_FAULT_NONE));
-           }
-       }
-       HAL_Delay(300U);
+    uint32_t now = HAL_GetTick();
+    ProgramButtons_Process(now);
+
+    ProgramDisplay_Update(now);
+
+    TemperatureDisplay_Process(now);
   }
   /* USER CODE END 3 */
 }
