@@ -81,7 +81,7 @@ typedef struct {
 #define USER_TEMPERATURE_MIN_TENTHS 1100U
 #define USER_TEMPERATURE_MAX_TENTHS 1340U
 #define USER_TEMPERATURE_STEP_TENTHS 10
-#define USER_TEMPERATURE_FAST_STEP_TENTHS 100
+#define USER_TEMPERATURE_FAST_STEP_TENTHS 50
 #define USER_TIME_MIN_MINUTES 0U
 #define USER_TIME_MAX_MINUTES 99U
 #define USER_TIME_STEP_MINUTES 1
@@ -683,7 +683,7 @@ static void MainCycle_Process(uint32_t now)
     case MAIN_PHASE_DRYING:
       if (elapsed >= ((uint32_t)gActiveProgram.dryMinutes * MINUTE_MS)) {
         MainCycle_SetPhase(MAIN_PHASE_DONE, now);
-        Buzzer_StartWithGap(3U, BUZZER_COMPLETE_MS, BUZZER_COMPLETE_MS);
+        Buzzer_StartWithGap(5U, BUZZER_COMPLETE_MS, 500U);
       }
       break;
 
