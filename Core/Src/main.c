@@ -58,6 +58,13 @@ typedef enum {
   MAIN_PHASE_DONE
 } MainCyclePhase;
 
+typedef enum {
+  STARTUP_SAFETY_CHECK_PT100 = 0,
+  STARTUP_SAFETY_FILL_WATER,
+  STARTUP_SAFETY_READY,
+  STARTUP_SAFETY_ERROR
+} StartupSafetyState;
+
 typedef struct {
   uint8_t pulseCount;
   uint8_t active;
@@ -98,7 +105,7 @@ typedef struct {
 #define MAIN_VACUUM_MS 60000U
 #define MAIN_EXHAUST_MS 30000U
 #define MINUTE_MS 60000U
-#define WATER_FILL_TIMEOUT_MS (3U * MINUTE_MS)
+#define WATER_FILL_TIMEOUT_MS (2U * MINUTE_MS)
 #define HEATING_TIMEOUT_MS (35U * MINUTE_MS)
 #define MAIN_OVER_TEMPERATURE_TENTHS 1380U
 #define MAIN_CYCLE_LED_BLINK_MS 500U
@@ -149,6 +156,8 @@ MainCyclePhase gMainDisplayPhase = MAIN_PHASE_STANDBY;
 uint16_t gMainDisplayValue = 0xffffU;
 BuzzerSequence gBuzzer = {0U, 0U, 0U, 0U, 0U, 0U};
 uint8_t gSafetyErrorActive = 0U;
+StartupSafetyState gStartupSafetyState = STARTUP_SAFETY_CHECK_PT100;
+uint32_t gStartupSafetyStartTick = 0U;
 
 static const ProgramConfig programPresets[PROGRAM_COUNT] = {
   {1210U, 15U, 0U}, {1210U, 20U, 15U}, {1320U, 7U, 10U},
@@ -206,6 +215,7 @@ static void MainCycle_UpdateTemperatureDisplay(uint32_t now);
 static void MainCycleDisplay_Update(uint32_t now);
 static void DisplayCycleChannel(void);
 static void DisplayEndMessage(void);
+static void DisplayReadyMessage(void);
 static void DisplayChannel(uint8_t channel);
 static uint16_t MainCycle_RemainingMinutes(uint32_t elapsed, uint16_t totalMinutes);
 static void MainCycleLeds_Clear(void);
@@ -215,6 +225,11 @@ static void MainCycleHoldingLeds_Update(uint32_t elapsed, uint8_t blinkOn);
 static uint8_t MainCycle_ReadTemperatureOrFail(void);
 static uint8_t DoorSwitch_IsClosed(void);
 static uint8_t MainCycle_CheckDoorOrFail(void);
+static void StartupSafety_Init(uint32_t now);
+static void StartupSafety_Process(uint32_t now);
+static uint8_t StartupSafety_IsReady(void);
+static void StartupSafety_SetReady(void);
+static uint8_t StartupSafety_CheckPt100(void);
 static uint8_t MainCycle_CheckStartConditions(uint32_t now);
 static uint8_t WaterSensor_HasWater(void);
 static void WaterLeds_Update(void);
@@ -264,6 +279,7 @@ static uint8_t SegmentForCharacter(char character)
     case 'n': return 0x54U;
     case 'r': return 0x50U;
     case 't': return 0x78U;
+    case 'y': return 0x6eU;
     default: return 0x00U;
   }
 }
@@ -282,7 +298,7 @@ static void ProgramButtons_Process(uint32_t now)
 {
   for (uint8_t i = 0U; i < PROGRAM_COUNT; ++i) {
     ButtonInput_Update(&gProgramButtons[i], now, PROGRAM_DEBOUNCE_MS, PROGRAM_LONG_PRESS_MS, PROGRAM_REPEAT_MS);
-    if (gMainCycleActive != 0U || gSafetyErrorActive != 0U) {
+    if (StartupSafety_IsReady() == 0U || gMainCycleActive != 0U || gSafetyErrorActive != 0U) {
       (void)ButtonInput_ConsumePressed(&gProgramButtons[i]);
     }
     else if (ButtonInput_ConsumePressed(&gProgramButtons[i]) != 0U) {
@@ -408,7 +424,7 @@ static void UserButtons_Process(uint32_t now)
   ButtonInput_Update(&gUpButton, now, PROGRAM_DEBOUNCE_MS, PROGRAM_LONG_PRESS_MS, PROGRAM_REPEAT_MS);
   ButtonInput_Update(&gDownButton, now, PROGRAM_DEBOUNCE_MS, PROGRAM_LONG_PRESS_MS, PROGRAM_REPEAT_MS);
 
-  if (gMainCycleActive != 0U || gSafetyErrorActive != 0U) {
+  if (StartupSafety_IsReady() == 0U || gMainCycleActive != 0U || gSafetyErrorActive != 0U) {
     (void)ButtonInput_ConsumePressed(&gUserButton);
     (void)ButtonInput_ConsumePressed(&gSetButton);
     (void)ButtonInput_ConsumePressed(&gUpButton);
@@ -609,6 +625,10 @@ static void StartButton_Process(uint32_t now)
   ButtonInput_Update(&gStartButton, now, PROGRAM_DEBOUNCE_MS, PROGRAM_LONG_PRESS_MS, PROGRAM_REPEAT_MS);
   if (ButtonInput_ConsumePressed(&gStartButton) == 0U) {
     return;
+  }
+
+  if (StartupSafety_IsReady() == 0U) {
+      return;
   }
 
   if (gSafetyErrorActive != 0U) {
@@ -925,6 +945,17 @@ static void DisplayEndMessage(void)
   tm1637DisplaySegments(&gDisplay1, segments);
 }
 
+static void DisplayReadyMessage(void)
+{
+  uint8_t segments[4];
+
+  segments[0] = SegmentForCharacter('r');
+  segments[1] = SegmentForCharacter('E');
+  segments[2] = SegmentForCharacter('d');
+  segments[3] = SegmentForCharacter('y');
+  tm1637DisplaySegments(&gDisplay1, segments);
+}
+
 static uint16_t MainCycle_RemainingMinutes(uint32_t elapsed, uint16_t totalMinutes)
 {
   uint32_t totalMs = (uint32_t)totalMinutes * MINUTE_MS;
@@ -1082,24 +1113,88 @@ static uint8_t MainCycle_CheckDoorOrFail(void)
   return 1U;
 }
 
+static void StartupSafety_Init(uint32_t now)
+{
+  gStartupSafetyState = STARTUP_SAFETY_CHECK_PT100;
+  gStartupSafetyStartTick = now;
+  tm1637Clear(&gDisplay1);
+  StartupSafety_Process(now);
+}
+
+static void StartupSafety_Process(uint32_t now)
+{
+  if (gStartupSafetyState == STARTUP_SAFETY_READY || gStartupSafetyState == STARTUP_SAFETY_ERROR) {
+    return;
+  }
+
+  WaterLeds_Update();
+
+  if (gStartupSafetyState == STARTUP_SAFETY_CHECK_PT100) {
+    SafetyOutputs_Stop();
+    if (StartupSafety_CheckPt100() == 0U) {
+      gStartupSafetyState = STARTUP_SAFETY_ERROR;
+      return;
+    }
+
+    if (WaterSensor_HasWater() != 0U) {
+      StartupSafety_SetReady();
+    }
+    else {
+      HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_SET);
+      gStartupSafetyState = STARTUP_SAFETY_FILL_WATER;
+      gStartupSafetyStartTick = now;
+    }
+    return;
+  }
+
+  if (WaterSensor_HasWater() != 0U) {
+    StartupSafety_SetReady();
+  }
+  else if ((now - gStartupSafetyStartTick) >= WATER_FILL_TIMEOUT_MS) {
+    SafetyError_Set(2U);
+    gStartupSafetyState = STARTUP_SAFETY_ERROR;
+  }
+  else {
+    HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_SET);
+  }
+}
+
+static uint8_t StartupSafety_IsReady(void)
+{
+  return (gStartupSafetyState == STARTUP_SAFETY_READY) ? 1U : 0U;
+}
+
+static void StartupSafety_SetReady(void){
+
+  SafetyOutputs_Stop();
+  WaterLeds_Update();
+  gStartupSafetyState = STARTUP_SAFETY_READY;
+  DisplayReadyMessage();
+  Buzzer_Start(2U, BUZZER_BUTTON_MS);
+}
+
+static uint8_t StartupSafety_CheckPt100(void)
+{
+  if (MainCycle_ReadTemperatureOrFail() == 0U) {
+    return 0U;
+  }
+
+  tm1637DisplayDecimalTenths(&gDisplay2, gTemperatureTenthsC);
+  if (gTemperatureTenthsC >= 0 && (uint16_t)gTemperatureTenthsC > MAIN_OVER_TEMPERATURE_TENTHS) {
+    SafetyError_Set(5U);
+    return 0U;
+  }
+
+  return 1U;
+}
+
 static uint8_t MainCycle_CheckStartConditions(uint32_t now)
 {
   (void)now;
 
   SafetyOutputs_Stop();
-  WaterLeds_Update();
 
   if (MainCycle_CheckDoorOrFail() == 0U) {
-      return 0U;
-  }
-
-  if (MainCycle_ReadTemperatureOrFail() == 0U) {
-    return 0U;
-  }
-  tm1637DisplayDecimalTenths(&gDisplay2, gTemperatureTenthsC);
-
-  if (gTemperatureTenthsC >= 0 && (uint16_t)gTemperatureTenthsC > MAIN_OVER_TEMPERATURE_TENTHS) {
-    SafetyError_Set(5U);
     return 0U;
   }
 
@@ -1275,9 +1370,7 @@ int main(void)
 
   Max31865_Init(&gMax31865, &hspi3, CS_GPIO_Port, CS_Pin, 430.0f, 100.0f);
   gSensorReady = Max31865_Begin(&gMax31865, MAX31865_2WIRE, 1U);
-  if (gSensorReady == 0U) {
-	  SafetyError_Set(1U);
-  }
+  StartupSafety_Init(HAL_GetTick());
 
   /* USER CODE END 2 */
 
@@ -1290,6 +1383,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     uint32_t now = HAL_GetTick();
+    StartupSafety_Process(now);
     StartButton_Process(now);
     ProgramButtons_Process(now);
     UserButtons_Process(now);
