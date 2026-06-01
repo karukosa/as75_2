@@ -25,6 +25,7 @@
 #include "max31865.h"
 #include "tm1637.h"
 #include "button_input.h"
+#include "pid.h"
 
 /* USER CODE END Includes */
 
@@ -111,9 +112,15 @@ typedef struct {
 #define USER_TIME_MAX_MINUTES 99U
 #define USER_TIME_STEP_MINUTES 1
 #define USER_TIME_FAST_STEP_MINUTES 10
-#define MAIN_VACUUM_MS 60000U
-#define MAIN_EXHAUST_MS 30000U
 #define MINUTE_MS 60000U
+#define MAIN_VACUUM_MS (13U * MINUTE_MS)
+#define MAIN_VACUUM_STEP_MS 156000U
+#define MAIN_EXHAUST_DRAIN_MS (2U * MINUTE_MS)
+#define MAIN_EXHAUST_VACUUM_MS (5U * MINUTE_MS)
+#define MAIN_EXHAUST_MS (MAIN_EXHAUST_DRAIN_MS + MAIN_EXHAUST_VACUUM_MS)
+#define MAIN_DRY_TEMPERATURE_LOW_TENTHS 780U
+#define MAIN_DRY_TEMPERATURE_HIGH_TENTHS 820U
+#define MAIN_HOLD_PID_WINDOW_MS 2000U
 #define WATER_FILL_TIMEOUT_MS (2U * MINUTE_MS)
 #define HEATING_TIMEOUT_MS (35U * MINUTE_MS)
 #define MAIN_OVER_TEMPERATURE_TENTHS 1380U
@@ -167,6 +174,12 @@ BuzzerSequence gBuzzer = {0U, 0U, 0U, 0U, 0U, 0U};
 uint8_t gSafetyErrorActive = 0U;
 StartupSafetyState gStartupSafetyState = STARTUP_SAFETY_CHECK_PT100;
 uint32_t gStartupSafetyStartTick = 0U;
+PID_TypeDef gHoldingPid;
+double gHoldingPidInput = 0.0;
+double gHoldingPidOutput = 0.0;
+double gHoldingPidSetpoint = 121.0;
+uint32_t gHoldingPidWindowStartTick = 0U;
+uint8_t gDryJacketHeaterOn = 0U;
 
 static const ProgramConfig programPresets[PROGRAM_COUNT] = {
   {1210U, 15U, 0U}, {1210U, 20U, 15U}, {1320U, 7U, 10U},
@@ -230,6 +243,11 @@ static void MainCycle_Stop(void);
 static void MainCycle_RecallLastRun(void);
 static void MainCycle_Process(uint32_t now);
 static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now);
+static void MainCycle_ApplyOutputs(uint32_t now);
+static void MainCycle_UpdateVacuumOutputs(uint32_t elapsed);
+static void MainCycle_UpdateHoldingOutputs(uint32_t now);
+static void MainCycle_UpdateExhaustOutputs(uint32_t elapsed);
+static void MainCycle_UpdateDryingOutputs(void);
 static void MainCycle_UpdateTemperatureDisplay(uint32_t now);
 static void MainCycleDisplay_Update(uint32_t now);
 static void DisplayCycleChannel(void);
@@ -774,6 +792,8 @@ static void MainCycle_Process(uint32_t now)
      }
    }
 
+  MainCycle_ApplyOutputs(now);
+
   switch (gMainCyclePhase) {
     case MAIN_PHASE_WATER_FILL:
       WaterLeds_Update();
@@ -845,6 +865,158 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
   gCycleLedBlinkTick = now;
   gMainDisplayPhase = MAIN_PHASE_STANDBY;
   gMainDisplayValue = 0xffffU;
+  if (phase == MAIN_PHASE_HOLDING) {
+      gHoldingPidInput = (double)gTemperatureTenthsC / 10.0;
+      gHoldingPidOutput = 0.0;
+      gHoldingPidSetpoint = (double)gActiveProgram.temperatureTenthsC / 10.0;
+      PID2(&gHoldingPid, &gHoldingPidInput, &gHoldingPidOutput, &gHoldingPidSetpoint,
+           25.0, 0.6, 5.0, _PID_CD_DIRECT);
+      PID_SetOutputLimits(&gHoldingPid, 0.0, 255.0);
+      PID_SetSampleTime(&gHoldingPid, 1000);
+      PID_SetMode(&gHoldingPid, _PID_MODE_AUTOMATIC);
+      gHoldingPidWindowStartTick = now;
+    }
+    else {
+      PID_SetMode(&gHoldingPid, _PID_MODE_MANUAL);
+      HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_RESET);
+    }
+
+    if (phase == MAIN_PHASE_DRYING) {
+      gDryJacketHeaterOn = 0U;
+    }
+
+    MainCycle_ApplyOutputs(now);
+  }
+
+  static void MainCycle_ApplyOutputs(uint32_t now)
+  {
+    uint32_t elapsed = now - gMainPhaseStartTick;
+
+    switch (gMainCyclePhase) {
+      case MAIN_PHASE_WATER_FILL:
+        HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_RESET);
+        break;
+
+      case MAIN_PHASE_VACUUM:
+        MainCycle_UpdateVacuumOutputs(elapsed);
+        break;
+
+      case MAIN_PHASE_HEATING:
+        HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_RESET);
+        break;
+
+      case MAIN_PHASE_HOLDING:
+        MainCycle_UpdateHoldingOutputs(now);
+        break;
+
+      case MAIN_PHASE_EXHAUST:
+        MainCycle_UpdateExhaustOutputs(elapsed);
+        break;
+
+      case MAIN_PHASE_DRYING:
+        MainCycle_UpdateDryingOutputs();
+        break;
+
+      case MAIN_PHASE_DONE:
+      default:
+        SafetyOutputs_Stop();
+        break;
+    }
+  }
+
+  static void MainCycle_UpdateVacuumOutputs(uint32_t elapsed)
+  {
+    uint8_t subPhase = (uint8_t)(elapsed / MAIN_VACUUM_STEP_MS);
+    uint8_t heaterStep = ((subPhase & 0x01U) != 0U || subPhase >= 4U) ? 1U : 0U;
+
+    HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_RESET);
+
+    if (heaterStep != 0U) {
+      HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_RESET);
+    }
+    else {
+      HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_SET);
+    }
+  }
+
+  static void MainCycle_UpdateHoldingOutputs(uint32_t now)
+  {
+    uint32_t onMs;
+
+    gHoldingPidInput = (double)gTemperatureTenthsC / 10.0;
+    gHoldingPidSetpoint = (double)gActiveProgram.temperatureTenthsC / 10.0;
+    (void)PID_Compute(&gHoldingPid);
+
+    if ((now - gHoldingPidWindowStartTick) >= MAIN_HOLD_PID_WINDOW_MS) {
+      gHoldingPidWindowStartTick += MAIN_HOLD_PID_WINDOW_MS;
+      if ((now - gHoldingPidWindowStartTick) >= MAIN_HOLD_PID_WINDOW_MS) {
+        gHoldingPidWindowStartTick = now;
+      }
+    }
+
+    onMs = (uint32_t)((gHoldingPidOutput * (double)MAIN_HOLD_PID_WINDOW_MS) / 255.0);
+    HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin,
+                      ((now - gHoldingPidWindowStartTick) < onMs) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_RESET);
+  }
+
+  static void MainCycle_UpdateExhaustOutputs(uint32_t elapsed)
+  {
+    HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_RESET);
+
+    if (elapsed < MAIN_EXHAUST_DRAIN_MS) {
+      HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_RESET);
+    }
+    else {
+      HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_SET);
+    }
+  }
+
+  static void MainCycle_UpdateDryingOutputs(void)
+  {
+    HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_SET);
+
+    if (gTemperatureTenthsC >= 0) {
+      if ((uint16_t)gTemperatureTenthsC <= MAIN_DRY_TEMPERATURE_LOW_TENTHS) {
+        gDryJacketHeaterOn = 1U;
+      }
+      else if ((uint16_t)gTemperatureTenthsC >= MAIN_DRY_TEMPERATURE_HIGH_TENTHS) {
+        gDryJacketHeaterOn = 0U;
+      }
+    }
+
+    HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin,
+                      (gDryJacketHeaterOn != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
 static void MainCycle_UpdateTemperatureDisplay(uint32_t now)
