@@ -49,6 +49,7 @@ typedef enum {
 
 typedef enum {
   MAIN_PHASE_STANDBY = 0,
+  MAIN_PHASE_WATER_FILL,
   MAIN_PHASE_VACUUM,
   MAIN_PHASE_HEATING,
   MAIN_PHASE_HOLDING,
@@ -92,9 +93,14 @@ typedef struct {
 #define BUZZER_COMPLETE_MS 1000U
 #define BUZZER_BETWEEN_PULSES_MS 150U
 #define BUZZER_START_GAP_MS 500U
+#define BUZZER_ERROR_MS 500U
+#define BUZZER_ERROR_PULSES 5U
 #define MAIN_VACUUM_MS 60000U
 #define MAIN_EXHAUST_MS 30000U
 #define MINUTE_MS 60000U
+#define WATER_FILL_TIMEOUT_MS (3U * MINUTE_MS)
+#define HEATING_TIMEOUT_MS (35U * MINUTE_MS)
+#define MAIN_OVER_TEMPERATURE_TENTHS 1380U
 #define MAIN_CYCLE_LED_BLINK_MS 500U
 #define ACTIVE_CHANNEL_USER 0U
 
@@ -142,6 +148,7 @@ uint32_t gCycleLedBlinkTick = 0U;
 MainCyclePhase gMainDisplayPhase = MAIN_PHASE_STANDBY;
 uint16_t gMainDisplayValue = 0xffffU;
 BuzzerSequence gBuzzer = {0U, 0U, 0U, 0U, 0U, 0U};
+uint8_t gSafetyErrorActive = 0U;
 
 static const ProgramConfig programPresets[PROGRAM_COUNT] = {
   {1210U, 15U, 0U}, {1210U, 20U, 15U}, {1320U, 7U, 10U},
@@ -205,6 +212,14 @@ static void MainCycleLeds_Clear(void);
 static void MainCycleLeds_Update(uint32_t now);
 static void MainCycleLed_Set(uint8_t ledIndex, uint8_t on);
 static void MainCycleHoldingLeds_Update(uint32_t elapsed, uint8_t blinkOn);
+static uint8_t MainCycle_ReadTemperatureOrFail(void);
+static uint8_t MainCycle_CheckStartConditions(uint32_t now);
+static uint8_t WaterSensor_HasWater(void);
+static void WaterLeds_Update(void);
+static void SafetyOutputs_Stop(void);
+static void SafetyError_Set(uint8_t code);
+static void SafetyError_Clear(void);
+static void Buzzer_ErrorBeep(void);
 static void Buzzer_Start(uint8_t pulseCount, uint32_t onMs);
 static void Buzzer_StartWithGap(uint8_t pulseCount, uint32_t onMs, uint32_t offMs);
 static void Buzzer_Process(uint32_t now);
@@ -216,9 +231,10 @@ static void Buzzer_Set(uint8_t on);
 /* USER CODE BEGIN 0 */
 static void DisplayErrorOnDisplay2(uint8_t code)
 {
-  /* E r r <code> */
-  uint8_t segments[4] = {0x79U, 0x50U, 0x50U, 0x00U};
+  /* E r 0 <code> => Er01..Er09. */
+  uint8_t segments[4] = {0x79U, 0x50U, 0x3fU, 0x00U};
   static const uint8_t digitMap[10] = {0x3fU, 0x06U, 0x5bU, 0x4fU, 0x66U, 0x6dU, 0x7dU, 0x07U, 0x7fU, 0x6fU};
+  segments[2] = digitMap[(code / 10U) % 10U];
   segments[3] = digitMap[code % 10U];
   tm1637DisplaySegments(&gDisplay2, segments);
 }
@@ -603,14 +619,13 @@ static void StartButton_Process(uint32_t now)
   }
   else {
     MainCycle_Start(now);
-    Buzzer_StartWithGap(3U, BUZZER_START_MS, BUZZER_START_GAP_MS);
   }
 }
 
 static void MainCycle_Start(uint32_t now)
 {
   if (gUserModeActive != 0U) {
-	gActiveProgram = gUserProgram;
+    gActiveProgram = gUserProgram;
 	gActiveProgramChannel = ACTIVE_CHANNEL_USER;
   }
   else if (gSelectedProgram < PROGRAM_COUNT) {
@@ -625,19 +640,35 @@ static void MainCycle_Start(uint32_t now)
     gActiveProgram = gUserProgram;
     gActiveProgramChannel = ACTIVE_CHANNEL_USER;
   }
+
+  SafetyError_Clear();
+    if (MainCycle_CheckStartConditions(now) == 0U) {
+      return;
+   }
+
   gMainCycleActive = 1U;
   UserMode_Exit();
   HAL_GPIO_WritePin(LD_Start_GPIO_Port, LD_Start_Pin, GPIO_PIN_SET);
   tm1637Clear(&gDisplay1);
-  tm1637Clear(&gDisplay2);
   gCycleLedBlinkPhase = 0xffU;
   gMainDisplayPhase = MAIN_PHASE_STANDBY;
   gMainDisplayValue = 0xffffU;
   gLastTemperatureReadTick = now - TEMPERATURE_REFRESH_MS;
-  MainCycle_SetPhase(MAIN_PHASE_VACUUM, now);
+
+  if (WaterSensor_HasWater() == 0U) {
+     HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_SET);
+     HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_SET);
+     MainCycle_SetPhase(MAIN_PHASE_WATER_FILL, now);
+   }
+   else {
+     MainCycle_SetPhase(MAIN_PHASE_VACUUM, now);
+   }
+
+  WaterLeds_Update();
   MainCycle_UpdateTemperatureDisplay(now);
   MainCycleDisplay_Update(now);
   MainCycleLeds_Update(now);
+  Buzzer_StartWithGap(3U, BUZZER_START_MS, BUZZER_START_GAP_MS);
 }
 
 static void MainCycle_Stop(void)
@@ -650,6 +681,7 @@ static void MainCycle_Stop(void)
   gMainDisplayPhase = MAIN_PHASE_STANDBY;
   gMainDisplayValue = 0xffffU;
   UserMode_Exit();
+  SafetyOutputs_Stop();
   ProgramLeds_Set(PROGRAM_NONE);
   MainCycleLeds_Clear();
   gCycleLedBlinkPhase = 0xffU;
@@ -680,7 +712,35 @@ static void MainCycle_Process(uint32_t now)
   }
 
   elapsed = now - gMainPhaseStartTick;
+
+  if (gMainCyclePhase != MAIN_PHASE_WATER_FILL && gMainCyclePhase != MAIN_PHASE_DONE) {
+     if (MainCycle_ReadTemperatureOrFail() == 0U) {
+       return;
+     }
+     if (gTemperatureTenthsC >= 0 && (uint16_t)gTemperatureTenthsC > MAIN_OVER_TEMPERATURE_TENTHS) {
+       SafetyError_Set(5U);
+       return;
+     }
+   }
+
   switch (gMainCyclePhase) {
+    case MAIN_PHASE_WATER_FILL:
+      WaterLeds_Update();
+      if (WaterSensor_HasWater() != 0U) {
+        SafetyOutputs_Stop();
+        WaterLeds_Update();
+        if (HAL_GPIO_ReadPin(L_Switch_GPIO_Port, L_Switch_Pin) != GPIO_PIN_SET) {
+          SafetyError_Set(3U);
+        }
+        else {
+          MainCycle_SetPhase(MAIN_PHASE_VACUUM, now);
+        }
+      }
+      else if (elapsed >= WATER_FILL_TIMEOUT_MS) {
+        SafetyError_Set(2U);
+      }
+      break;
+
     case MAIN_PHASE_VACUUM:
       if (elapsed >= MAIN_VACUUM_MS) {
         MainCycle_SetPhase(MAIN_PHASE_HEATING, now);
@@ -688,7 +748,10 @@ static void MainCycle_Process(uint32_t now)
       break;
 
     case MAIN_PHASE_HEATING:
-      if (gTemperatureTenthsC >= 0 && (uint16_t)gTemperatureTenthsC >= gActiveProgram.temperatureTenthsC) {
+      if (elapsed >= HEATING_TIMEOUT_MS) {
+    	SafetyError_Set(4U);
+      }
+        else if (gTemperatureTenthsC >= 0 && (uint16_t)gTemperatureTenthsC >= gActiveProgram.temperatureTenthsC) {
         MainCycle_SetPhase(MAIN_PHASE_HOLDING, now);
       }
       break;
@@ -761,6 +824,7 @@ static void MainCycleDisplay_Update(uint32_t now)
 
   elapsed = now - gMainPhaseStartTick;
   switch (gMainCyclePhase) {
+    case MAIN_PHASE_WATER_FILL:
     case MAIN_PHASE_VACUUM:
     case MAIN_PHASE_HEATING:
     case MAIN_PHASE_EXHAUST:
@@ -891,6 +955,10 @@ static void MainCycleLeds_Update(uint32_t now)
   MainCycleLeds_Clear();
 
   switch (gMainCyclePhase) {
+    case MAIN_PHASE_WATER_FILL:
+      MainCycleLed_Set(0U, blinkOn);
+      break;
+
     case MAIN_PHASE_VACUUM:
       MainCycleLed_Set(0U, blinkOn);
       break;
@@ -976,6 +1044,99 @@ static void MainCycleHoldingLeds_Update(uint32_t elapsed, uint8_t blinkOn)
   }
 }
 
+static uint8_t MainCycle_ReadTemperatureOrFail(void)
+{
+  if (gSensorReady == 0U || Max31865_ReadTemperatureTenthsC(&gMax31865, &gTemperatureTenthsC) == 0U) {
+    SafetyError_Set(1U);
+    return 0U;
+  }
+  return 1U;
+}
+
+static uint8_t MainCycle_CheckStartConditions(uint32_t now)
+{
+  (void)now;
+
+  SafetyOutputs_Stop();
+  WaterLeds_Update();
+
+  if (MainCycle_ReadTemperatureOrFail() == 0U) {
+    return 0U;
+  }
+  tm1637DisplayDecimalTenths(&gDisplay2, gTemperatureTenthsC);
+
+  if (gTemperatureTenthsC >= 0 && (uint16_t)gTemperatureTenthsC > MAIN_OVER_TEMPERATURE_TENTHS) {
+    SafetyError_Set(5U);
+    return 0U;
+  }
+
+  if (WaterSensor_HasWater() != 0U && HAL_GPIO_ReadPin(L_Switch_GPIO_Port, L_Switch_Pin) != GPIO_PIN_SET) {
+    SafetyError_Set(3U);
+    return 0U;
+  }
+
+  return 1U;
+}
+
+static uint8_t WaterSensor_HasWater(void)
+{
+  return (HAL_GPIO_ReadPin(Water_S_GPIO_Port, Water_S_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
+}
+
+static void WaterLeds_Update(void)
+{
+  if (WaterSensor_HasWater() != 0U) {
+    HAL_GPIO_WritePin(LD_HW_GPIO_Port, LD_HW_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LD_LW_GPIO_Port, LD_LW_Pin, GPIO_PIN_SET);
+  }
+  else {
+    HAL_GPIO_WritePin(LD_HW_GPIO_Port, LD_HW_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(LD_LW_GPIO_Port, LD_LW_Pin, GPIO_PIN_RESET);
+  }
+}
+
+static void SafetyOutputs_Stop(void)
+{
+  HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_RESET);
+}
+
+static void SafetyError_Set(uint8_t code)
+{
+  gMainCycleActive = 0U;
+  gMainCyclePhase = MAIN_PHASE_STANDBY;
+  SafetyOutputs_Stop();
+  HAL_GPIO_WritePin(LD_Start_GPIO_Port, LD_Start_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LD_Alarm_GPIO_Port, LD_Alarm_Pin, GPIO_PIN_SET);
+  DisplayErrorOnDisplay2(code);
+  Buzzer_ErrorBeep();
+}
+
+static void SafetyError_Clear(void)
+{
+  gSafetyErrorActive = 0U;
+  HAL_GPIO_WritePin(LD_Alarm_GPIO_Port, LD_Alarm_Pin, GPIO_PIN_RESET);
+  Buzzer_Set(0U);
+  gBuzzer.active = 0U;
+  gBuzzer.outputOn = 0U;
+}
+
+static void Buzzer_ErrorBeep(void)
+{
+  gSafetyErrorActive = 1U;
+  gBuzzer.pulseCount = BUZZER_ERROR_PULSES;
+  gBuzzer.active = 1U;
+  gBuzzer.outputOn = 1U;
+  gBuzzer.onMs = BUZZER_ERROR_MS;
+  gBuzzer.offMs = BUZZER_BETWEEN_PULSES_MS;
+  gBuzzer.lastToggleTick = HAL_GetTick();
+  Buzzer_Set(1U);
+}
+
 static void Buzzer_Start(uint8_t pulseCount, uint32_t onMs)
 {
   Buzzer_StartWithGap(pulseCount, onMs, BUZZER_BETWEEN_PULSES_MS);
@@ -983,7 +1144,7 @@ static void Buzzer_Start(uint8_t pulseCount, uint32_t onMs)
 
 static void Buzzer_StartWithGap(uint8_t pulseCount, uint32_t onMs, uint32_t offMs)
 {
-  if (pulseCount == 0U || onMs == 0U) {
+  if (gSafetyErrorActive != 0U || pulseCount == 0U || onMs == 0U) {
     return;
   }
 
@@ -999,6 +1160,7 @@ static void Buzzer_StartWithGap(uint8_t pulseCount, uint32_t onMs, uint32_t offM
 static void Buzzer_Process(uint32_t now)
 {
   if (gBuzzer.active == 0U) {
+    Buzzer_Set(1U);
     return;
   }
 
@@ -1074,12 +1236,20 @@ int main(void)
   ProgramLeds_Set(PROGRAM_NONE);
   UserLed_Update();
   HAL_GPIO_WritePin(LD_Start_GPIO_Port, LD_Start_Pin, GPIO_PIN_RESET);
-  Buzzer_Set(0U);
+  HAL_GPIO_WritePin(LD_HW_GPIO_Port, LD_HW_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(LD_LW_GPIO_Port, LD_LW_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(LD_Alarm_GPIO_Port, LD_Alarm_Pin, GPIO_PIN_RESET);
+  SafetyOutputs_Stop();
+  HAL_GPIO_WritePin(LD_HW_GPIO_Port, LD_HW_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(LD_LW_GPIO_Port, LD_LW_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(LD_Alarm_GPIO_Port, LD_Alarm_Pin, GPIO_PIN_RESET);
+  SafetyOutputs_Stop();
+  SafetyError_Set(1U);
 
   Max31865_Init(&gMax31865, &hspi3, CS_GPIO_Port, CS_Pin, 430.0f, 100.0f);
   gSensorReady = Max31865_Begin(&gMax31865, MAX31865_2WIRE, 1U);
   if (gSensorReady == 0U) {
-      DisplayErrorOnDisplay2(1U);
+	  SafetyError_Set(1U);
   }
 
   /* USER CODE END 2 */
@@ -1212,9 +1382,11 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOE, LD_C3_Pin|LD_C4_Pin|LD_C5_Pin|LD_C6_Pin
-                          |LD_C7_Pin|LD_Alarm_Pin|LD_LW_Pin|LD_HW_Pin
-                          |SSR_Heater_Pin|SSR_HResistor_Pin|Relay_Valve1_Pin|Relay_Valve2_Pin
-                          |Relay_Valve3_Pin|LD_C1_Pin|LD_C2_Pin, GPIO_PIN_RESET);
+		                  |LD_C7_Pin|LD_Alarm_Pin|SSR_Heater_Pin|SSR_HResistor_Pin
+		                  |Relay_Valve1_Pin|Relay_Valve2_Pin|Relay_Valve3_Pin|LD_C1_Pin
+		                  |LD_C2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOE, LD_LW_Pin|LD_HW_Pin, GPIO_PIN_SET);
+
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_RESET);
