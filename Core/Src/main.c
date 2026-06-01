@@ -135,6 +135,8 @@ MainCyclePhase gMainCyclePhase = MAIN_PHASE_STANDBY;
 ProgramConfig gActiveProgram = {1210U, 15U, 0U};
 uint8_t gActiveProgramChannel = ACTIVE_CHANNEL_USER;
 uint32_t gMainPhaseStartTick = 0U;
+ProgramConfig gLastRunProgram = {1210U, 15U, 0U};
+uint8_t gLastRunProgramChannel = PROGRAM_NONE;
 uint8_t gCycleLedBlinkPhase = 0xffU;
 uint32_t gCycleLedBlinkTick = 0U;
 MainCyclePhase gMainDisplayPhase = MAIN_PHASE_STANDBY;
@@ -190,18 +192,19 @@ static void StartButton_Init(void);
 static void StartButton_Process(uint32_t now);
 static void MainCycle_Start(uint32_t now);
 static void MainCycle_Stop(void);
+static void MainCycle_RecallLastRun(void);
 static void MainCycle_Process(uint32_t now);
 static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now);
 static void MainCycle_UpdateTemperatureDisplay(uint32_t now);
 static void MainCycleDisplay_Update(uint32_t now);
 static void DisplayCycleChannel(void);
 static void DisplayEndMessage(void);
+static void DisplayChannel(uint8_t channel);
 static uint16_t MainCycle_RemainingMinutes(uint32_t elapsed, uint16_t totalMinutes);
 static void MainCycleLeds_Clear(void);
 static void MainCycleLeds_Update(uint32_t now);
 static void MainCycleLed_Set(uint8_t ledIndex, uint8_t on);
 static void MainCycleHoldingLeds_Update(uint32_t elapsed, uint8_t blinkOn);
-static const ProgramConfig *GetSelectedProgramConfig(void);
 static void Buzzer_Start(uint8_t pulseCount, uint32_t onMs);
 static void Buzzer_StartWithGap(uint8_t pulseCount, uint32_t onMs, uint32_t offMs);
 static void Buzzer_Process(uint32_t now);
@@ -591,7 +594,11 @@ static void StartButton_Process(uint32_t now)
   }
 
   if (gMainCycleActive != 0U) {
+	uint8_t completed = (gMainCyclePhase == MAIN_PHASE_DONE) ? 1U : 0U;
     MainCycle_Stop();
+    if (completed != 0U) {
+      MainCycle_RecallLastRun();
+    }
     Buzzer_Start(1U, BUZZER_STOP_MS);
   }
   else {
@@ -602,17 +609,22 @@ static void StartButton_Process(uint32_t now)
 
 static void MainCycle_Start(uint32_t now)
 {
-  const ProgramConfig *selectedProgram = GetSelectedProgramConfig();
-
-  if (selectedProgram != NULL) {
-    gActiveProgram = *selectedProgram;
-    gActiveProgramChannel = (gSelectedProgram < PROGRAM_COUNT) ? (uint8_t)(gSelectedProgram + 1U) : ACTIVE_CHANNEL_USER;
+  if (gUserModeActive != 0U) {
+	gActiveProgram = gUserProgram;
+	gActiveProgramChannel = ACTIVE_CHANNEL_USER;
+  }
+  else if (gSelectedProgram < PROGRAM_COUNT) {
+	gActiveProgram = programPresets[gSelectedProgram];
+	gActiveProgramChannel = (uint8_t)(gSelectedProgram + 1U);
+  }
+  else if (gLastRunProgramChannel != PROGRAM_NONE) {
+	gActiveProgram = gLastRunProgram;
+	gActiveProgramChannel = gLastRunProgramChannel;
   }
   else {
     gActiveProgram = gUserProgram;
     gActiveProgramChannel = ACTIVE_CHANNEL_USER;
   }
-
   gMainCycleActive = 1U;
   UserMode_Exit();
   HAL_GPIO_WritePin(LD_Start_GPIO_Port, LD_Start_Pin, GPIO_PIN_SET);
@@ -644,6 +656,19 @@ static void MainCycle_Stop(void)
   HAL_GPIO_WritePin(LD_Start_GPIO_Port, LD_Start_Pin, GPIO_PIN_RESET);
   tm1637Clear(&gDisplay1);
   tm1637Clear(&gDisplay2);
+}
+
+static void MainCycle_RecallLastRun(void)
+{
+  if (gLastRunProgramChannel == PROGRAM_NONE) {
+    return;
+  }
+
+  gActiveProgram = gLastRunProgram;
+  gActiveProgramChannel = gLastRunProgramChannel;
+  gMainDisplayPhase = MAIN_PHASE_STANDBY;
+  gMainDisplayValue = 0xffffU;
+  DisplayCycleChannel();
 }
 
 static void MainCycle_Process(uint32_t now)
@@ -682,6 +707,8 @@ static void MainCycle_Process(uint32_t now)
 
     case MAIN_PHASE_DRYING:
       if (elapsed >= ((uint32_t)gActiveProgram.dryMinutes * MINUTE_MS)) {
+        gLastRunProgram = gActiveProgram;
+    	gLastRunProgramChannel = gActiveProgramChannel;
         MainCycle_SetPhase(MAIN_PHASE_DONE, now);
         Buzzer_StartWithGap(5U, BUZZER_COMPLETE_MS, 500U);
       }
@@ -788,17 +815,22 @@ static void MainCycleDisplay_Update(uint32_t now)
 
 static void DisplayCycleChannel(void)
 {
+  DisplayChannel(gActiveProgramChannel);
+}
+
+static void DisplayChannel(uint8_t channel)
+{
   uint8_t segments[4];
 
   segments[0] = SegmentForCharacter('C');
   segments[1] = SegmentForCharacter('H') | (1U << 7);
-  if (gActiveProgramChannel == ACTIVE_CHANNEL_USER) {
+  if (channel == ACTIVE_CHANNEL_USER) {
     segments[2] = SegmentForCharacter('U');
     segments[3] = SegmentForCharacter('S');
   }
   else {
     segments[2] = SegmentForCharacter('0');
-    segments[3] = SegmentForCharacter((char)('0' + (gActiveProgramChannel % 10U)));
+    segments[3] = SegmentForCharacter((char)('0' + (channel  % 10U)));
   }
 
   tm1637DisplaySegments(&gDisplay1, segments);
@@ -942,17 +974,6 @@ static void MainCycleHoldingLeds_Update(uint32_t elapsed, uint8_t blinkOn)
     MainCycleLed_Set(3U, 1U);
     MainCycleLed_Set(4U, blinkOn);
   }
-}
-
-static const ProgramConfig *GetSelectedProgramConfig(void)
-{
-  if (gUserModeActive != 0U) {
-    return &gUserProgram;
-  }
-  if (gSelectedProgram < PROGRAM_COUNT) {
-    return &programPresets[gSelectedProgram];
-  }
-  return NULL;
 }
 
 static void Buzzer_Start(uint8_t pulseCount, uint32_t onMs)
