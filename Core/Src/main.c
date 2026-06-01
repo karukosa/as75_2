@@ -94,7 +94,7 @@ typedef struct {
 #define BUZZER_BETWEEN_PULSES_MS 150U
 #define BUZZER_START_GAP_MS 500U
 #define BUZZER_ERROR_MS 500U
-#define BUZZER_ERROR_PULSES 5U
+#define BUZZER_ERROR_PULSES 4U
 #define MAIN_VACUUM_MS 60000U
 #define MAIN_EXHAUST_MS 30000U
 #define MINUTE_MS 60000U
@@ -213,6 +213,8 @@ static void MainCycleLeds_Update(uint32_t now);
 static void MainCycleLed_Set(uint8_t ledIndex, uint8_t on);
 static void MainCycleHoldingLeds_Update(uint32_t elapsed, uint8_t blinkOn);
 static uint8_t MainCycle_ReadTemperatureOrFail(void);
+static uint8_t DoorSwitch_IsClosed(void);
+static uint8_t MainCycle_CheckDoorOrFail(void);
 static uint8_t MainCycle_CheckStartConditions(uint32_t now);
 static uint8_t WaterSensor_HasWater(void);
 static void WaterLeds_Update(void);
@@ -713,6 +715,10 @@ static void MainCycle_Process(uint32_t now)
 
   elapsed = now - gMainPhaseStartTick;
 
+  if (gMainCyclePhase != MAIN_PHASE_DONE && MainCycle_CheckDoorOrFail() == 0U) {
+     return;
+   }
+
   if (gMainCyclePhase != MAIN_PHASE_WATER_FILL && gMainCyclePhase != MAIN_PHASE_DONE) {
      if (MainCycle_ReadTemperatureOrFail() == 0U) {
        return;
@@ -729,8 +735,8 @@ static void MainCycle_Process(uint32_t now)
       if (WaterSensor_HasWater() != 0U) {
         SafetyOutputs_Stop();
         WaterLeds_Update();
-        if (HAL_GPIO_ReadPin(L_Switch_GPIO_Port, L_Switch_Pin) != GPIO_PIN_SET) {
-          SafetyError_Set(3U);
+        if (MainCycle_CheckDoorOrFail() == 0U) {
+        	 return;
         }
         else {
           MainCycle_SetPhase(MAIN_PHASE_VACUUM, now);
@@ -773,7 +779,7 @@ static void MainCycle_Process(uint32_t now)
         gLastRunProgram = gActiveProgram;
     	gLastRunProgramChannel = gActiveProgramChannel;
         MainCycle_SetPhase(MAIN_PHASE_DONE, now);
-        Buzzer_StartWithGap(5U, BUZZER_COMPLETE_MS, 500U);
+        Buzzer_StartWithGap(4U, BUZZER_COMPLETE_MS, 500U);
       }
       break;
 
@@ -1053,12 +1059,31 @@ static uint8_t MainCycle_ReadTemperatureOrFail(void)
   return 1U;
 }
 
+static uint8_t DoorSwitch_IsClosed(void)
+{
+  return (HAL_GPIO_ReadPin(L_Switch_GPIO_Port, L_Switch_Pin) == GPIO_PIN_SET) ? 1U : 0U;
+}
+
+static uint8_t MainCycle_CheckDoorOrFail(void)
+{
+  if (DoorSwitch_IsClosed() == 0U) {
+    SafetyError_Set(3U);
+    return 0U;
+  }
+
+  return 1U;
+}
+
 static uint8_t MainCycle_CheckStartConditions(uint32_t now)
 {
   (void)now;
 
   SafetyOutputs_Stop();
   WaterLeds_Update();
+
+  if (MainCycle_CheckDoorOrFail() == 0U) {
+      return 0U;
+  }
 
   if (MainCycle_ReadTemperatureOrFail() == 0U) {
     return 0U;
@@ -1067,11 +1092,6 @@ static uint8_t MainCycle_CheckStartConditions(uint32_t now)
 
   if (gTemperatureTenthsC >= 0 && (uint16_t)gTemperatureTenthsC > MAIN_OVER_TEMPERATURE_TENTHS) {
     SafetyError_Set(5U);
-    return 0U;
-  }
-
-  if (WaterSensor_HasWater() != 0U && HAL_GPIO_ReadPin(L_Switch_GPIO_Port, L_Switch_Pin) != GPIO_PIN_SET) {
-    SafetyError_Set(3U);
     return 0U;
   }
 
@@ -1160,7 +1180,7 @@ static void Buzzer_StartWithGap(uint8_t pulseCount, uint32_t onMs, uint32_t offM
 static void Buzzer_Process(uint32_t now)
 {
   if (gBuzzer.active == 0U) {
-    Buzzer_Set(1U);
+ Buzzer_Set(0U);
     return;
   }
 
@@ -1244,7 +1264,6 @@ int main(void)
   HAL_GPIO_WritePin(LD_LW_GPIO_Port, LD_LW_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(LD_Alarm_GPIO_Port, LD_Alarm_Pin, GPIO_PIN_RESET);
   SafetyOutputs_Stop();
-  SafetyError_Set(1U);
 
   Max31865_Init(&gMax31865, &hspi3, CS_GPIO_Port, CS_Pin, 430.0f, 100.0f);
   gSensorReady = Max31865_Begin(&gMax31865, MAX31865_2WIRE, 1U);
@@ -1269,8 +1288,8 @@ int main(void)
     UserLed_Update();
     ProgramDisplay_Update(now);
     UserDisplay_Update(now);
-    TemperatureDisplay_Process(now);
     MainCycle_Process(now);
+    TemperatureDisplay_Process(now);
     MainCycleDisplay_Update(now);
     MainCycleLeds_Update(now);
     Buzzer_Process(now);
@@ -1437,11 +1456,17 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(CS_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : BOOT1_Pin L_Switch_Pin */
-  GPIO_InitStruct.Pin = BOOT1_Pin|L_Switch_Pin;
+  /*Configure GPIO pins : BOOT1_Pin */
+  GPIO_InitStruct.Pin = BOOT1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(BOOT1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : L_Switch_Pin */
+  GPIO_InitStruct.Pin = L_Switch_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(L_Switch_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : Buzzer_Pin CLK1_Pin DIO1_Pin CLK2_Pin
                            DIO2_Pin */
