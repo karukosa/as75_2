@@ -282,7 +282,7 @@ static void ProgramButtons_Process(uint32_t now)
 {
   for (uint8_t i = 0U; i < PROGRAM_COUNT; ++i) {
     ButtonInput_Update(&gProgramButtons[i], now, PROGRAM_DEBOUNCE_MS, PROGRAM_LONG_PRESS_MS, PROGRAM_REPEAT_MS);
-    if (gMainCycleActive != 0U) {
+    if (gMainCycleActive != 0U || gSafetyErrorActive != 0U) {
       (void)ButtonInput_ConsumePressed(&gProgramButtons[i]);
     }
     else if (ButtonInput_ConsumePressed(&gProgramButtons[i]) != 0U) {
@@ -408,7 +408,7 @@ static void UserButtons_Process(uint32_t now)
   ButtonInput_Update(&gUpButton, now, PROGRAM_DEBOUNCE_MS, PROGRAM_LONG_PRESS_MS, PROGRAM_REPEAT_MS);
   ButtonInput_Update(&gDownButton, now, PROGRAM_DEBOUNCE_MS, PROGRAM_LONG_PRESS_MS, PROGRAM_REPEAT_MS);
 
-  if (gMainCycleActive != 0U) {
+  if (gMainCycleActive != 0U || gSafetyErrorActive != 0U) {
     (void)ButtonInput_ConsumePressed(&gUserButton);
     (void)ButtonInput_ConsumePressed(&gSetButton);
     (void)ButtonInput_ConsumePressed(&gUpButton);
@@ -608,6 +608,14 @@ static void StartButton_Process(uint32_t now)
 {
   ButtonInput_Update(&gStartButton, now, PROGRAM_DEBOUNCE_MS, PROGRAM_LONG_PRESS_MS, PROGRAM_REPEAT_MS);
   if (ButtonInput_ConsumePressed(&gStartButton) == 0U) {
+    return;
+  }
+
+  if (gSafetyErrorActive != 0U) {
+    SafetyError_Clear();
+    MainCycle_Stop();
+    gLastTemperatureReadTick = now - TEMPERATURE_REFRESH_MS;
+    Buzzer_Start(1U, BUZZER_BUTTON_MS);
     return;
   }
 
