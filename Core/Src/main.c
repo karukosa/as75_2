@@ -65,8 +65,25 @@ typedef enum {
   STARTUP_SAFETY_ERROR
 } StartupSafetyState;
 
+typedef enum {
+  BUZZER_EVENT_OFF = 0,
+  BUZZER_EVENT_BUTTON,
+  BUZZER_EVENT_READY,
+  BUZZER_EVENT_START,
+  BUZZER_EVENT_STOP,
+  BUZZER_EVENT_COMPLETE,
+  BUZZER_EVENT_ERROR,
+  BUZZER_EVENT_COUNT
+} BuzzerEvent;
+
 typedef struct {
   uint8_t pulseCount;
+  uint32_t onMs;
+  uint32_t offMs;
+ } BuzzerPattern;
+
+ typedef struct {
+  uint8_t remainingPulses;
   uint8_t active;
   uint8_t outputOn;
   uint32_t onMs;
@@ -94,14 +111,6 @@ typedef struct {
 #define USER_TIME_MAX_MINUTES 99U
 #define USER_TIME_STEP_MINUTES 1
 #define USER_TIME_FAST_STEP_MINUTES 10
-#define BUZZER_BUTTON_MS 300U
-#define BUZZER_START_MS 500U
-#define BUZZER_STOP_MS 1000U
-#define BUZZER_COMPLETE_MS 1000U
-#define BUZZER_BETWEEN_PULSES_MS 150U
-#define BUZZER_START_GAP_MS 500U
-#define BUZZER_ERROR_MS 500U
-#define BUZZER_ERROR_PULSES 4U
 #define MAIN_VACUUM_MS 60000U
 #define MAIN_EXHAUST_MS 30000U
 #define MINUTE_MS 60000U
@@ -177,6 +186,16 @@ static const GpioOutput cycleLeds[7] = {
   {LD_C7_GPIO_Port, LD_C7_Pin}
 };
 
+static const BuzzerPattern buzzerPatterns[BUZZER_EVENT_COUNT] = {
+  [BUZZER_EVENT_OFF] = {0U, 0U, 0U},
+  [BUZZER_EVENT_BUTTON] = {1U, 300U, 150U},
+  [BUZZER_EVENT_READY] = {2U, 300U, 150U},
+  [BUZZER_EVENT_START] = {3U, 500U, 500U},
+  [BUZZER_EVENT_STOP] = {2U, 1000U, 150U},
+  [BUZZER_EVENT_COMPLETE] = {4U, 1000U, 500U},
+  [BUZZER_EVENT_ERROR] = {4U, 500U, 150U}
+};
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -236,9 +255,7 @@ static void WaterLeds_Update(void);
 static void SafetyOutputs_Stop(void);
 static void SafetyError_Set(uint8_t code);
 static void SafetyError_Clear(void);
-static void Buzzer_ErrorBeep(void);
-static void Buzzer_Start(uint8_t pulseCount, uint32_t onMs);
-static void Buzzer_StartWithGap(uint8_t pulseCount, uint32_t onMs, uint32_t offMs);
+static void Buzzer_Play(BuzzerEvent event);
 static void Buzzer_Process(uint32_t now);
 static void Buzzer_Set(uint8_t on);
 
@@ -303,7 +320,7 @@ static void ProgramButtons_Process(uint32_t now)
     }
     else if (ButtonInput_ConsumePressed(&gProgramButtons[i]) != 0U) {
       Program_Select(i, now);
-      Buzzer_Start(1U, BUZZER_BUTTON_MS);
+      Buzzer_Play(BUZZER_EVENT_BUTTON);
     }
   }
 }
@@ -438,7 +455,7 @@ static void UserButtons_Process(uint32_t now)
     if (gMainCycleActive == 0U) {
       UserMode_Enter(now);
     }
-    Buzzer_Start(1U, BUZZER_BUTTON_MS);
+    Buzzer_Play(BUZZER_EVENT_BUTTON);
   }
 
   if (gUserModeActive == 0U) {
@@ -452,7 +469,7 @@ static void UserButtons_Process(uint32_t now)
 
   if (ButtonInput_ConsumePressed(&gSetButton) != 0U) {
     UserMode_NextField(now);
-    Buzzer_Start(1U, BUZZER_BUTTON_MS);
+    Buzzer_Play(BUZZER_EVENT_BUTTON);
   }
 
   if (ButtonInput_ConsumePressed(&gUpButton) != 0U) {
@@ -635,7 +652,7 @@ static void StartButton_Process(uint32_t now)
     SafetyError_Clear();
     MainCycle_Stop();
     gLastTemperatureReadTick = now - TEMPERATURE_REFRESH_MS;
-    Buzzer_Start(1U, BUZZER_BUTTON_MS);
+    Buzzer_Play(BUZZER_EVENT_BUTTON);
     return;
   }
 
@@ -645,7 +662,7 @@ static void StartButton_Process(uint32_t now)
     if (completed != 0U) {
       MainCycle_RecallLastRun();
     }
-    Buzzer_Start(1U, BUZZER_STOP_MS);
+    Buzzer_Play(BUZZER_EVENT_STOP);
   }
   else {
     MainCycle_Start(now);
@@ -698,7 +715,7 @@ static void MainCycle_Start(uint32_t now)
   MainCycle_UpdateTemperatureDisplay(now);
   MainCycleDisplay_Update(now);
   MainCycleLeds_Update(now);
-  Buzzer_StartWithGap(3U, BUZZER_START_MS, BUZZER_START_GAP_MS);
+  Buzzer_Play(BUZZER_EVENT_START);
 }
 
 static void MainCycle_Stop(void)
@@ -807,7 +824,7 @@ static void MainCycle_Process(uint32_t now)
         gLastRunProgram = gActiveProgram;
     	gLastRunProgramChannel = gActiveProgramChannel;
         MainCycle_SetPhase(MAIN_PHASE_DONE, now);
-        Buzzer_StartWithGap(4U, BUZZER_COMPLETE_MS, 500U);
+        Buzzer_Play(BUZZER_EVENT_COMPLETE);
       }
       break;
 
@@ -1170,7 +1187,7 @@ static void StartupSafety_SetReady(void){
   WaterLeds_Update();
   gStartupSafetyState = STARTUP_SAFETY_READY;
   DisplayReadyMessage();
-  Buzzer_Start(2U, BUZZER_BUTTON_MS);
+  Buzzer_Play(BUZZER_EVENT_READY);
 }
 
 static uint8_t StartupSafety_CheckPt100(void)
@@ -1236,46 +1253,49 @@ static void SafetyError_Set(uint8_t code)
   HAL_GPIO_WritePin(LD_Start_GPIO_Port, LD_Start_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(LD_Alarm_GPIO_Port, LD_Alarm_Pin, GPIO_PIN_SET);
   DisplayErrorOnDisplay2(code);
-  Buzzer_ErrorBeep();
+  Buzzer_Play(BUZZER_EVENT_ERROR);
 }
 
 static void SafetyError_Clear(void)
 {
   gSafetyErrorActive = 0U;
   HAL_GPIO_WritePin(LD_Alarm_GPIO_Port, LD_Alarm_Pin, GPIO_PIN_RESET);
-  Buzzer_Set(0U);
-  gBuzzer.active = 0U;
-  gBuzzer.outputOn = 0U;
+  Buzzer_Play(BUZZER_EVENT_OFF);
 }
 
-static void Buzzer_ErrorBeep(void)
+static void Buzzer_Play(BuzzerEvent event)
 {
-  gSafetyErrorActive = 1U;
-  gBuzzer.pulseCount = BUZZER_ERROR_PULSES;
-  gBuzzer.active = 1U;
-  gBuzzer.outputOn = 1U;
-  gBuzzer.onMs = BUZZER_ERROR_MS;
-  gBuzzer.offMs = BUZZER_BETWEEN_PULSES_MS;
-  gBuzzer.lastToggleTick = HAL_GetTick();
-  Buzzer_Set(1U);
-}
+  const BuzzerPattern *pattern;
 
-static void Buzzer_Start(uint8_t pulseCount, uint32_t onMs)
-{
-  Buzzer_StartWithGap(pulseCount, onMs, BUZZER_BETWEEN_PULSES_MS);
-}
-
-static void Buzzer_StartWithGap(uint8_t pulseCount, uint32_t onMs, uint32_t offMs)
-{
-  if (gSafetyErrorActive != 0U || pulseCount == 0U || onMs == 0U) {
+  if (event == BUZZER_EVENT_OFF) {
+    gBuzzer.remainingPulses = 0U;
+    gBuzzer.active = 0U;
+    gBuzzer.outputOn = 0U;
+    Buzzer_Set(0U);
     return;
   }
 
-  gBuzzer.pulseCount = pulseCount;
+  if (event >= BUZZER_EVENT_COUNT) {
+     return;
+   }
+
+   if (event == BUZZER_EVENT_ERROR) {
+     gSafetyErrorActive = 1U;
+   }
+   else if (gSafetyErrorActive != 0U) {
+     return;
+   }
+
+   pattern = &buzzerPatterns[event];
+   if (pattern->pulseCount == 0U || pattern->onMs == 0U) {
+    return;
+  }
+
+  gBuzzer.remainingPulses = pattern->pulseCount;
   gBuzzer.active = 1U;
   gBuzzer.outputOn = 1U;
-  gBuzzer.onMs = onMs;
-  gBuzzer.offMs = offMs;
+  gBuzzer.onMs = pattern->onMs;
+  gBuzzer.offMs = pattern->offMs;
   gBuzzer.lastToggleTick = HAL_GetTick();
   Buzzer_Set(1U);
 }
@@ -1283,7 +1303,7 @@ static void Buzzer_StartWithGap(uint8_t pulseCount, uint32_t onMs, uint32_t offM
 static void Buzzer_Process(uint32_t now)
 {
   if (gBuzzer.active == 0U) {
- Buzzer_Set(0U);
+    Buzzer_Set(0U);
     return;
   }
 
@@ -1292,14 +1312,14 @@ static void Buzzer_Process(uint32_t now)
       Buzzer_Set(0U);
       gBuzzer.outputOn = 0U;
       gBuzzer.lastToggleTick = now;
-      if (gBuzzer.pulseCount > 0U) {
-        --gBuzzer.pulseCount;
+      if (gBuzzer.remainingPulses > 0U) {
+        --gBuzzer.remainingPulses;
       }
     }
   }
   else if ((now - gBuzzer.lastToggleTick) >= gBuzzer.offMs) {
-    if (gBuzzer.pulseCount == 0U) {
-      gBuzzer.active = 0U;
+	    if (gBuzzer.remainingPulses == 0U) {
+	    	gBuzzer.active = 0U;
     }
     else {
       Buzzer_Set(1U);
