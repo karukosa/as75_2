@@ -120,7 +120,12 @@ typedef struct {
 #define MAIN_EXHAUST_MS (MAIN_EXHAUST_DRAIN_MS + MAIN_EXHAUST_VACUUM_MS)
 #define MAIN_DRY_TEMPERATURE_LOW_TENTHS 780U
 #define MAIN_DRY_TEMPERATURE_HIGH_TENTHS 820U
-#define MAIN_HOLD_PID_WINDOW_MS 2000U
+#define MAIN_HOLD_PID_WINDOW_MS 5000U
+#define MAIN_HOLD_PID_SAMPLE_MS 1000U
+#define MAIN_HOLD_PID_KP 18.0
+#define MAIN_HOLD_PID_KI 0.08
+#define MAIN_HOLD_PID_KD 5.0
+#define MAIN_HOLD_PID_INITIAL_OUTPUT 96.0
 #define WATER_FILL_TIMEOUT_MS (2U * MINUTE_MS)
 #define HEATING_TIMEOUT_MS (35U * MINUTE_MS)
 #define MAIN_OVER_TEMPERATURE_TENTHS 1380U
@@ -867,12 +872,12 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
   gMainDisplayValue = 0xffffU;
   if (phase == MAIN_PHASE_HOLDING) {
       gHoldingPidInput = (double)gTemperatureTenthsC / 10.0;
-      gHoldingPidOutput = 0.0;
+      gHoldingPidOutput = MAIN_HOLD_PID_INITIAL_OUTPUT;
       gHoldingPidSetpoint = (double)gActiveProgram.temperatureTenthsC / 10.0;
       PID2(&gHoldingPid, &gHoldingPidInput, &gHoldingPidOutput, &gHoldingPidSetpoint,
-           25.0, 0.6, 5.0, _PID_CD_DIRECT);
+    		  MAIN_HOLD_PID_KP, MAIN_HOLD_PID_KI, MAIN_HOLD_PID_KD, _PID_CD_DIRECT);
       PID_SetOutputLimits(&gHoldingPid, 0.0, 255.0);
-      PID_SetSampleTime(&gHoldingPid, 1000);
+      PID_SetSampleTime(&gHoldingPid, MAIN_HOLD_PID_SAMPLE_MS);
       PID_SetMode(&gHoldingPid, _PID_MODE_AUTOMATIC);
       gHoldingPidWindowStartTick = now;
     }
