@@ -114,7 +114,11 @@ typedef struct {
 #define USER_TIME_FAST_STEP_MINUTES 10
 #define MINUTE_MS 60000U
 #define MAIN_VACUUM_MS (13U * MINUTE_MS)
-#define MAIN_VACUUM_STEP_MS 156000U
+#define MAIN_VACUUM_CYCLE_COUNT 3U
+#define MAIN_VACUUM_STEP_MS (MAIN_VACUUM_MS / (MAIN_VACUUM_CYCLE_COUNT * 2U))
+#define MAIN_ASSIST_JACKET_HEATER_ON_MS 10000U
+#define MAIN_ASSIST_JACKET_HEATER_OFF_MS 10000U
+#define MAIN_ASSIST_JACKET_HEATER_CUTOFF_TENTHS 100U
 #define MAIN_EXHAUST_DRAIN_MS (2U * MINUTE_MS)
 #define MAIN_EXHAUST_VACUUM_MS (5U * MINUTE_MS)
 #define MAIN_EXHAUST_MS (MAIN_EXHAUST_DRAIN_MS + MAIN_EXHAUST_VACUUM_MS)
@@ -245,11 +249,13 @@ static void StartButton_Init(void);
 static void StartButton_Process(uint32_t now);
 static void MainCycle_Start(uint32_t now);
 static void MainCycle_Stop(void);
+static void MainCycle_EnableStopExhaust(void);
 static void MainCycle_RecallLastRun(void);
 static void MainCycle_Process(uint32_t now);
 static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now);
 static void MainCycle_ApplyOutputs(uint32_t now);
 static void MainCycle_UpdateVacuumOutputs(uint32_t elapsed);
+static GPIO_PinState MainCycle_GetAssistJacketHeaterState(uint32_t elapsed);
 static void MainCycle_UpdateHoldingOutputs(uint32_t now);
 static void MainCycle_UpdateExhaustOutputs(uint32_t elapsed);
 static void MainCycle_UpdateDryingOutputs(void);
@@ -685,6 +691,9 @@ static void StartButton_Process(uint32_t now)
     if (completed != 0U) {
       MainCycle_RecallLastRun();
     }
+    else {
+      MainCycle_EnableStopExhaust();
+    }
     Buzzer_Play(BUZZER_EVENT_STOP);
   }
   else {
@@ -758,6 +767,11 @@ static void MainCycle_Stop(void)
   HAL_GPIO_WritePin(LD_Start_GPIO_Port, LD_Start_Pin, GPIO_PIN_RESET);
   tm1637Clear(&gDisplay1);
   tm1637Clear(&gDisplay2);
+}
+
+static void MainCycle_EnableStopExhaust(void)
+{
+  HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_SET);
 }
 
 static void MainCycle_RecallLastRun(void)
@@ -913,7 +927,8 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
 
       case MAIN_PHASE_HEATING:
         HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_SET);
-        HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin,
+                                  MainCycle_GetAssistJacketHeaterState(elapsed));
         HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_RESET);
@@ -942,9 +957,10 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
   static void MainCycle_UpdateVacuumOutputs(uint32_t elapsed)
   {
     uint8_t subPhase = (uint8_t)(elapsed / MAIN_VACUUM_STEP_MS);
-    uint8_t heaterStep = ((subPhase & 0x01U) != 0U || subPhase >= 4U) ? 1U : 0U;
+    uint8_t heaterStep = ((subPhase & 0x01U) != 0U) ? 1U : 0U;
 
-    HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin,
+                          (heaterStep != 0U) ? MainCycle_GetAssistJacketHeaterState(elapsed) : GPIO_PIN_RESET);
     HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_RESET);
 
@@ -959,6 +975,26 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
       HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_SET);
     }
   }
+
+  static GPIO_PinState MainCycle_GetAssistJacketHeaterState(uint32_t elapsed)
+   {
+     const uint32_t cycleMs = MAIN_ASSIST_JACKET_HEATER_ON_MS + MAIN_ASSIST_JACKET_HEATER_OFF_MS;
+     uint16_t cutoffTemperatureTenthsC = 0U;
+
+     if (gActiveProgram.temperatureTenthsC > MAIN_ASSIST_JACKET_HEATER_CUTOFF_TENTHS) {
+       cutoffTemperatureTenthsC = gActiveProgram.temperatureTenthsC - MAIN_ASSIST_JACKET_HEATER_CUTOFF_TENTHS;
+     }
+
+     if (gTemperatureTenthsC >= 0 && (uint16_t)gTemperatureTenthsC >= cutoffTemperatureTenthsC) {
+       return GPIO_PIN_RESET;
+     }
+
+     if (cycleMs == 0U) {
+       return GPIO_PIN_RESET;
+     }
+
+     return ((elapsed % cycleMs) < MAIN_ASSIST_JACKET_HEATER_ON_MS) ? GPIO_PIN_SET : GPIO_PIN_RESET;
+   }
 
   static void MainCycle_UpdateHoldingOutputs(uint32_t now)
   {
