@@ -50,7 +50,6 @@ typedef enum {
 
 typedef enum {
   MAIN_PHASE_STANDBY = 0,
-  MAIN_PHASE_WATER_FILL,
   MAIN_PHASE_VACUUM,
   MAIN_PHASE_HEATING,
   MAIN_PHASE_HOLDING,
@@ -734,16 +733,8 @@ static void MainCycle_Start(uint32_t now)
   gMainDisplayValue = 0xffffU;
   gLastTemperatureReadTick = now - TEMPERATURE_REFRESH_MS;
 
-  if (WaterSensor_HasWater() == 0U) {
-     HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_SET);
-     HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_SET);
-     MainCycle_SetPhase(MAIN_PHASE_WATER_FILL, now);
-   }
-   else {
-     MainCycle_SetPhase(MAIN_PHASE_VACUUM, now);
-   }
+  MainCycle_SetPhase(MAIN_PHASE_VACUUM, now);
 
-  WaterLeds_Update();
   MainCycle_UpdateTemperatureDisplay(now);
   MainCycleDisplay_Update(now);
   MainCycleLeds_Update(now);
@@ -801,8 +792,8 @@ static void MainCycle_Process(uint32_t now)
      return;
    }
 
-  if (gMainCyclePhase != MAIN_PHASE_WATER_FILL && gMainCyclePhase != MAIN_PHASE_DONE) {
-     if (MainCycle_ReadTemperatureOrFail() == 0U) {
+  if (gMainCyclePhase != MAIN_PHASE_DONE) {
+	  if (MainCycle_ReadTemperatureOrFail() == 0U) {
        return;
      }
      if (gTemperatureTenthsC >= 0 && (uint16_t)gTemperatureTenthsC > MAIN_OVER_TEMPERATURE_TENTHS) {
@@ -814,23 +805,6 @@ static void MainCycle_Process(uint32_t now)
   MainCycle_ApplyOutputs(now);
 
   switch (gMainCyclePhase) {
-    case MAIN_PHASE_WATER_FILL:
-      WaterLeds_Update();
-      if (WaterSensor_HasWater() != 0U) {
-        SafetyOutputs_Stop();
-        WaterLeds_Update();
-        if (MainCycle_CheckDoorOrFail() == 0U) {
-        	 return;
-        }
-        else {
-          MainCycle_SetPhase(MAIN_PHASE_VACUUM, now);
-        }
-      }
-      else if (elapsed >= WATER_FILL_TIMEOUT_MS) {
-        SafetyError_Set(2U);
-      }
-      break;
-
     case MAIN_PHASE_VACUUM:
       if (elapsed >= MAIN_VACUUM_MS) {
         MainCycle_SetPhase(MAIN_PHASE_HEATING, now);
@@ -912,15 +886,6 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
     uint32_t elapsed = now - gMainPhaseStartTick;
 
     switch (gMainCyclePhase) {
-      case MAIN_PHASE_WATER_FILL:
-        HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_SET);
-        HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_RESET);
-        break;
-
       case MAIN_PHASE_VACUUM:
         MainCycle_UpdateVacuumOutputs(elapsed);
         break;
@@ -1087,7 +1052,6 @@ static void MainCycleDisplay_Update(uint32_t now)
 
   elapsed = now - gMainPhaseStartTick;
   switch (gMainCyclePhase) {
-    case MAIN_PHASE_WATER_FILL:
     case MAIN_PHASE_VACUUM:
     case MAIN_PHASE_HEATING:
     case MAIN_PHASE_EXHAUST:
@@ -1229,10 +1193,6 @@ static void MainCycleLeds_Update(uint32_t now)
   MainCycleLeds_Clear();
 
   switch (gMainCyclePhase) {
-    case MAIN_PHASE_WATER_FILL:
-      MainCycleLed_Set(0U, blinkOn);
-      break;
-
     case MAIN_PHASE_VACUUM:
       MainCycleLed_Set(0U, blinkOn);
       break;
