@@ -130,6 +130,9 @@ typedef struct {
 #define MAIN_HOLD_PID_KD 5.0
 #define MAIN_HOLD_PID_INITIAL_OUTPUT 96.0
 #define WATER_FILL_TIMEOUT_MS (2U * MINUTE_MS)
+/* Temporary bypass so the cycle can be tested without the water sensor/check.
+ * Set 0U to use real sensor*/
+#define WATER_CHECK_BYPASS_FOR_TEST 1U
 #define HEATING_TIMEOUT_MS (35U * MINUTE_MS)
 #define MAIN_OVER_TEMPERATURE_TENTHS 1380U
 #define MAIN_CYCLE_LED_BLINK_MS 500U
@@ -1392,7 +1395,11 @@ static uint8_t MainCycle_CheckStartConditions(uint32_t now)
 
 static uint8_t WaterSensor_HasWater(void)
 {
-  return (HAL_GPIO_ReadPin(Water_S_GPIO_Port, Water_S_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
+  #if WATER_CHECK_BYPASS_FOR_TEST
+    return 1U;
+  #else
+    return (HAL_GPIO_ReadPin(Water_S_GPIO_Port, Water_S_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
+  #endif
 }
 
 static void WaterLeds_Update(void)
