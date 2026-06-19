@@ -123,11 +123,11 @@ typedef struct {
 #define MAIN_EXHAUST_MS (MAIN_EXHAUST_DRAIN_MS + MAIN_EXHAUST_VACUUM_MS)
 #define MAIN_DRY_TEMPERATURE_LOW_TENTHS 980U
 #define MAIN_DRY_TEMPERATURE_HIGH_TENTHS 1020U
-#define MAIN_HOLD_PID_WINDOW_MS 5000U
-#define MAIN_HOLD_PID_SAMPLE_MS 1000U
-#define MAIN_HOLD_PID_KP 18.0
-#define MAIN_HOLD_PID_KI 0.08
-#define MAIN_HOLD_PID_KD 5.0
+#define MAIN_HOLD_PID_WINDOW_MS 2000U
+#define MAIN_HOLD_PID_SAMPLE_MS 500U
+#define MAIN_HOLD_PID_KP 24.0
+#define MAIN_HOLD_PID_KI 0.18
+#define MAIN_HOLD_PID_KD 3.0
 #define MAIN_HOLD_PID_INITIAL_OUTPUT 96.0
 #define WATER_FILL_TIMEOUT_MS (2U * MINUTE_MS)
 /* Temporary bypass so the cycle can be tested without the water sensor/check.
@@ -1003,6 +1003,8 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
       HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_RESET);
       HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_SET);
       HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin,
+                              MainCycle_GetAssistJacketHeaterState(elapsed - MAIN_EXHAUST_DRAIN_MS));
     }
   }
 
