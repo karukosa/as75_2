@@ -61,6 +61,7 @@ typedef enum {
 
 typedef enum {
   STARTUP_SAFETY_CHECK_PT100 = 0,
+
   STARTUP_SAFETY_FILL_WATER,
   STARTUP_SAFETY_READY,
   STARTUP_SAFETY_ERROR
@@ -1777,10 +1778,10 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pins : B_P1_Pin B_P2_Pin B_P3_Pin B_P4_Pin
                            B_P5_Pin B_P6_Pin B_Start_Pin B_Set_Pin
-                           B_Up_Pin B_Down_Pin B_User_Pin */
+                           B_Up_Pin B_Down_Pin Water_S_Pin B_User_Pin */
   GPIO_InitStruct.Pin = B_P1_Pin|B_P2_Pin|B_P3_Pin|B_P4_Pin
                           |B_P5_Pin|B_P6_Pin|B_Start_Pin|B_Set_Pin
-                          |B_Up_Pin|B_Down_Pin|B_User_Pin;
+                          |B_Up_Pin|B_Down_Pin|Water_S_Pin|B_User_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
@@ -1825,12 +1826,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : Water_S_Pin */
-  GPIO_InitStruct.Pin = Water_S_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(Water_S_GPIO_Port, &GPIO_InitStruct);
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
