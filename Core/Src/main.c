@@ -55,7 +55,6 @@ typedef enum {
   MAIN_PHASE_HOLDING,
   MAIN_PHASE_EXHAUST,
   MAIN_PHASE_DRYING,
-  MAIN_PHASE_DRY_COOLING,
   MAIN_PHASE_DONE
 } MainCyclePhase;
 
@@ -125,7 +124,7 @@ typedef struct {
 #define MAIN_EXHAUST_MS (MAIN_EXHAUST_DRAIN_MS + MAIN_EXHAUST_VACUUM_MS)
 #define MAIN_DRY_TEMPERATURE_LOW_TENTHS 980U
 #define MAIN_DRY_TEMPERATURE_HIGH_TENTHS 1020U
-#define MAIN_DRY_COOLING_VACUUM_MS (3U * MINUTE_MS)
+#define MAIN_DRY_HEATER_CUTOFF_MS (5U * MINUTE_MS)
 #define MAIN_HOLD_PID_WINDOW_MS 2000U
 #define MAIN_HOLD_PID_SAMPLE_MS 500U
 #define MAIN_HOLD_PID_KP 24.0
@@ -135,7 +134,7 @@ typedef struct {
 #define WATER_FILL_TIMEOUT_MS (3U * MINUTE_MS)
 /* Temporary bypass so the cycle can be tested without the water sensor/check.
  * Set 0U to use real sensor*/
-#define WATER_CHECK_BYPASS_FOR_TEST 0U
+#define WATER_CHECK_BYPASS_FOR_TEST 1U
 #define HEATING_TIMEOUT_MS (35U * MINUTE_MS)
 #define MAIN_OVER_TEMPERATURE_TENTHS 1380U
 #define MAIN_CYCLE_LED_BLINK_MS 500U
@@ -263,8 +262,7 @@ static void MainCycle_UpdateVacuumOutputs(uint32_t elapsed);
 static GPIO_PinState MainCycle_GetAssistJacketHeaterState(uint32_t elapsed);
 static void MainCycle_UpdateHoldingOutputs(uint32_t now);
 static void MainCycle_UpdateExhaustOutputs(uint32_t elapsed);
-static void MainCycle_UpdateDryingOutputs(void);
-static void MainCycle_UpdateDryCoolingOutputs(void);
+static void MainCycle_UpdateDryingOutputs(uint32_t elapsed);
 static void MainCycle_UpdateTemperatureDisplay(uint32_t now);
 static void MainCycleDisplay_Update(uint32_t now);
 static void DisplayCycleChannel(void);
@@ -841,20 +839,6 @@ static void MainCycle_Process(uint32_t now)
 
     case MAIN_PHASE_DRYING:
       if (elapsed >= ((uint32_t)gActiveProgram.dryMinutes * MINUTE_MS)) {
-    	  if (gActiveProgram.dryMinutes == 0U) {
-    	            gLastRunProgram = gActiveProgram;
-    	            gLastRunProgramChannel = gActiveProgramChannel;
-    	            MainCycle_SetPhase(MAIN_PHASE_DONE, now);
-    	            Buzzer_Play(BUZZER_EVENT_COMPLETE);
-    	          }
-    	          else {
-    	            MainCycle_SetPhase(MAIN_PHASE_DRY_COOLING, now);
-    	          }
-    	        }
-    	        break;
-
-     case MAIN_PHASE_DRY_COOLING:
-    	        if (elapsed >= MAIN_DRY_COOLING_VACUUM_MS) {
         gLastRunProgram = gActiveProgram;
         gLastRunProgramChannel = gActiveProgramChannel;
         MainCycle_SetPhase(MAIN_PHASE_DONE, now);
@@ -929,11 +913,7 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
         break;
 
       case MAIN_PHASE_DRYING:
-        MainCycle_UpdateDryingOutputs();
-        break;
-
-      case MAIN_PHASE_DRY_COOLING:
-        MainCycle_UpdateDryCoolingOutputs();
+    	  MainCycle_UpdateDryingOutputs(elapsed);
         break;
 
       case MAIN_PHASE_DONE:
@@ -1030,7 +1010,7 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
     }
   }
 
-  static void MainCycle_UpdateDryingOutputs(void)
+  static void MainCycle_UpdateDryingOutputs(uint32_t elapsed)
   {
     HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_RESET);
@@ -1038,7 +1018,11 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
     HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_SET);
 
-    if (gTemperatureTenthsC >= 0) {
+    if ((((uint32_t)gActiveProgram.dryMinutes * MINUTE_MS) <= MAIN_DRY_HEATER_CUTOFF_MS) ||
+            (elapsed >= (((uint32_t)gActiveProgram.dryMinutes * MINUTE_MS) - MAIN_DRY_HEATER_CUTOFF_MS))) {
+        gDryJacketHeaterOn = 0U;
+      }
+      else if (gTemperatureTenthsC >= 0) {
       if ((uint16_t)gTemperatureTenthsC <= MAIN_DRY_TEMPERATURE_LOW_TENTHS) {
         gDryJacketHeaterOn = 1U;
       }
@@ -1049,16 +1033,6 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
 
     HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin,
                       (gDryJacketHeaterOn != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-}
-
-static void MainCycle_UpdateDryCoolingOutputs(void)
-{
-  HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_SET);
 }
 
 static void MainCycle_UpdateTemperatureDisplay(uint32_t now)
@@ -1110,15 +1084,6 @@ static void MainCycleDisplay_Update(uint32_t now)
 
     case MAIN_PHASE_DRYING:
       displayValue = MainCycle_RemainingMinutes(elapsed, gActiveProgram.dryMinutes);
-      if (gMainDisplayPhase != gMainCyclePhase || displayValue != gMainDisplayValue) {
-        DisplayProgramTime(&gDisplay1, "Dr", displayValue);
-      }
-      gMainDisplayPhase = gMainCyclePhase;
-      gMainDisplayValue = displayValue;
-      break;
-
-    case MAIN_PHASE_DRY_COOLING:
-      displayValue = MainCycle_RemainingMinutes(elapsed, (uint16_t)(MAIN_DRY_COOLING_VACUUM_MS / MINUTE_MS));
       if (gMainDisplayPhase != gMainCyclePhase || displayValue != gMainDisplayValue) {
         DisplayProgramTime(&gDisplay1, "Dr", displayValue);
       }
@@ -1262,7 +1227,6 @@ static void MainCycleLeds_Update(uint32_t now)
       break;
 
     case MAIN_PHASE_DRYING:
-    case MAIN_PHASE_DRY_COOLING:
       for (uint8_t i = 0U; i < 6U; ++i) {
         MainCycleLed_Set(i, 1U);
       }
