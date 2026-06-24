@@ -134,7 +134,7 @@ typedef struct {
 #define WATER_FILL_TIMEOUT_MS (3U * MINUTE_MS)
 /* Temporary bypass so the cycle can be tested without the water sensor/check.
  * Set 0U to use real sensor*/
-#define WATER_CHECK_BYPASS_FOR_TEST 1U
+#define WATER_CHECK_BYPASS_FOR_TEST 0U
 #define HEATING_TIMEOUT_MS (35U * MINUTE_MS)
 #define MAIN_OVER_TEMPERATURE_TENTHS 1380U
 #define MAIN_CYCLE_LED_BLINK_MS 500U
@@ -791,8 +791,6 @@ static void MainCycle_Process(uint32_t now)
     return;
   }
 
-  elapsed = now - gMainPhaseStartTick;
-
   if (gMainCyclePhase != MAIN_PHASE_DONE && MainCycle_CheckDoorOrFail() == 0U) {
      return;
    }
@@ -807,33 +805,38 @@ static void MainCycle_Process(uint32_t now)
      }
    }
 
-  MainCycle_ApplyOutputs(now);
+  elapsed = now - gMainPhaseStartTick;
 
   switch (gMainCyclePhase) {
     case MAIN_PHASE_VACUUM:
       if (elapsed >= MAIN_VACUUM_MS) {
         MainCycle_SetPhase(MAIN_PHASE_HEATING, now);
+        return;
       }
       break;
 
     case MAIN_PHASE_HEATING:
       if (elapsed >= HEATING_TIMEOUT_MS) {
     	SafetyError_Set(4U);
+    	return;
       }
         else if (gTemperatureTenthsC >= 0 && (uint16_t)gTemperatureTenthsC >= gActiveProgram.temperatureTenthsC) {
         MainCycle_SetPhase(MAIN_PHASE_HOLDING, now);
+        return;
       }
       break;
 
     case MAIN_PHASE_HOLDING:
       if (elapsed >= ((uint32_t)gActiveProgram.sterilizeMinutes * MINUTE_MS)) {
         MainCycle_SetPhase(MAIN_PHASE_EXHAUST, now);
+        return;
       }
       break;
 
     case MAIN_PHASE_EXHAUST:
       if (elapsed >= MAIN_EXHAUST_MS) {
         MainCycle_SetPhase(MAIN_PHASE_DRYING, now);
+        return;
       }
       break;
 
@@ -843,6 +846,7 @@ static void MainCycle_Process(uint32_t now)
         gLastRunProgramChannel = gActiveProgramChannel;
         MainCycle_SetPhase(MAIN_PHASE_DONE, now);
         Buzzer_Play(BUZZER_EVENT_COMPLETE);
+        return;
       }
       break;
 
@@ -851,8 +855,10 @@ static void MainCycle_Process(uint32_t now)
 
     default:
       MainCycle_Stop();
-      break;
+      return;
   }
+
+  MainCycle_ApplyOutputs(now);
 }
 
 static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
@@ -1047,7 +1053,11 @@ static void MainCycle_UpdateTemperatureDisplay(uint32_t now)
       tm1637DisplayDecimalTenths(&gDisplay2, gTemperatureTenthsC);
     }
     else {
-      DisplayErrorOnDisplay2(Max31865_ReadFault(&gMax31865, MAX31865_FAULT_NONE));
+    	/* During an active cycle, do not show raw MAX31865 fault bits as Erxx.
+    	 * Code 04 is reserved for the heating timeout safety error and can be
+    	 * confused with a transient MAX31865 OV/UV bit when vacuum toggles from
+    	 * pump to heater. MainCycle_Process() performs the real sensor safety
+         * check and raises Er01 if the temperature read is invalid. */
     }
   }
 }
