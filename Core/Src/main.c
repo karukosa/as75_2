@@ -1742,10 +1742,10 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pins : B_P1_Pin B_P2_Pin B_P3_Pin B_P4_Pin
                            B_P5_Pin B_P6_Pin B_Start_Pin B_Set_Pin
-                           B_Up_Pin B_Down_Pin Water_S_Pin B_User_Pin */
+                           B_Up_Pin B_Down_Pin B_User_Pin */
   GPIO_InitStruct.Pin = B_P1_Pin|B_P2_Pin|B_P3_Pin|B_P4_Pin
                           |B_P5_Pin|B_P6_Pin|B_Start_Pin|B_Set_Pin
-                          |B_Up_Pin|B_Down_Pin|Water_S_Pin|B_User_Pin;
+                          |B_Up_Pin|B_Down_Pin|B_User_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
@@ -1763,8 +1763,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(CS_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : BOOT1_Pin L_Switch_Pin */
-  GPIO_InitStruct.Pin = BOOT1_Pin|L_Switch_Pin;
+  /*Configure GPIO pins : BOOT1_Pin Water_S_Pin L_Switch_Pin */
+  GPIO_InitStruct.Pin = BOOT1_Pin|Water_S_Pin|L_Switch_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);

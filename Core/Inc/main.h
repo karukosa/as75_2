@@ -111,6 +111,8 @@ void Error_Handler(void);
 #define Relay_Valve3_GPIO_Port GPIOE
 #define Buzzer_Pin GPIO_PIN_10
 #define Buzzer_GPIO_Port GPIOB
+#define Water_S_Pin GPIO_PIN_12
+#define Water_S_GPIO_Port GPIOB
 #define L_Switch_Pin GPIO_PIN_13
 #define L_Switch_GPIO_Port GPIOB
 #define Relay_Pump_Pin GPIO_PIN_8
@@ -143,8 +145,6 @@ void Error_Handler(void);
 #define SWDIO_GPIO_Port GPIOA
 #define SWCLK_Pin GPIO_PIN_14
 #define SWCLK_GPIO_Port GPIOA
-#define Water_S_Pin GPIO_PIN_10
-#define Water_S_GPIO_Port GPIOC
 #define B_User_Pin GPIO_PIN_12
 #define B_User_GPIO_Port GPIOC
 #define LD_P3_Pin GPIO_PIN_0
