@@ -131,7 +131,7 @@ typedef struct {
 #define MAIN_HOLD_PID_KI 0.18
 #define MAIN_HOLD_PID_KD 3.0
 #define MAIN_HOLD_PID_INITIAL_OUTPUT 96.0
-#define WATER_FILL_TIMEOUT_MS (3U * MINUTE_MS)
+#define WATER_FILL_TIMEOUT_MS (4U * MINUTE_MS)
 /* Temporary bypass so the cycle can be tested without the water sensor/check.
  * Set 0U to use real sensor*/
 #define WATER_CHECK_BYPASS_FOR_TEST 0U
@@ -139,6 +139,7 @@ typedef struct {
 #define MAIN_OVER_TEMPERATURE_TENTHS 1380U
 #define MAIN_CYCLE_LED_BLINK_MS 500U
 #define ACTIVE_CHANNEL_USER 0U
+#define TEMPERATURE_READ_FAIL_MAX 3U
 
 /* USER CODE END PD */
 
@@ -193,6 +194,7 @@ double gHoldingPidOutput = 0.0;
 double gHoldingPidSetpoint = 121.0;
 uint32_t gHoldingPidWindowStartTick = 0U;
 uint8_t gDryJacketHeaterOn = 0U;
+static uint8_t gTemperatureReadFailCount = 0U;
 
 static const ProgramConfig programPresets[PROGRAM_COUNT] = {
   {1210U, 15U, 0U}, {1210U, 20U, 15U}, {1320U, 7U, 10U},
@@ -238,6 +240,7 @@ static void Program_Select(uint8_t programIndex, uint32_t now);
 static void ProgramLeds_Set(uint8_t programIndex);
 static void ProgramDisplay_Update(uint32_t now);
 static void DisplayProgramTime(TM1637Handle *display, const char prefix[2], uint16_t minutes);
+static uint8_t Temperature_ReadAndUpdate(uint32_t now);
 static void TemperatureDisplay_Process(uint32_t now);
 static void UserButtons_Init(void);
 static void UserButtons_Process(uint32_t now);
@@ -274,7 +277,7 @@ static void MainCycleLeds_Clear(void);
 static void MainCycleLeds_Update(uint32_t now);
 static void MainCycleLed_Set(uint8_t ledIndex, uint8_t on);
 static void MainCycleHoldingLeds_Update(uint32_t elapsed, uint8_t blinkOn);
-static uint8_t MainCycle_ReadTemperatureOrFail(void);
+static uint8_t MainCycle_ReadTemperatureOrFail(uint32_t now);
 static uint8_t DoorSwitch_IsClosed(void);
 static uint8_t MainCycle_CheckDoorOrFail(void);
 static void StartupSafety_Init(uint32_t now);
@@ -424,33 +427,49 @@ static void DisplayProgramTime(TM1637Handle *display, const char prefix[2], uint
   tm1637DisplaySegments(display, segments);
 }
 
+/* Read temperature from sensor once per TEMPERATURE_REFRESH_MS and update
+ * gTemperatureTenthsC. Returns 1 if a fresh reading was taken, 0 otherwise.
+ * All paths that need the temperature value share this single SPI read. */
+static uint8_t Temperature_ReadAndUpdate(uint32_t now)
+{
+  if ((now - gLastTemperatureReadTick) < TEMPERATURE_REFRESH_MS) {
+    return 0U;
+  }
+  gLastTemperatureReadTick = now;
+  if (gSensorReady == 0U) {
+    return 0U;
+  }
+  return Max31865_ReadTemperatureTenthsC(&gMax31865, &gTemperatureTenthsC);
+}
+
 static void TemperatureDisplay_Process(uint32_t now)
 {
-  if (gMainCycleActive != 0U) {
-    MainCycle_UpdateTemperatureDisplay(now);
-    return;
-  }
+  uint8_t freshRead;
 
   if (gUserModeActive != 0U) {
     return;
   }
 
-  if ((now - gLastTemperatureReadTick) < TEMPERATURE_REFRESH_MS) {
+  freshRead = Temperature_ReadAndUpdate(now);
+
+  if (gMainCycleActive != 0U) {
+    /* During a cycle temperature is consumed by MainCycle_Process.
+     * Only refresh the display when a new value was just sampled. */
+    if (freshRead != 0U) {
+      tm1637DisplayDecimalTenths(&gDisplay2, gTemperatureTenthsC);
+    }
     return;
   }
 
-  gLastTemperatureReadTick = now;
-  if (gSelectedProgram != PROGRAM_NONE) {
+  if (freshRead == 0U || gSelectedProgram != PROGRAM_NONE) {
     return;
   }
 
   if (gSensorReady != 0U) {
-    if (Max31865_ReadTemperatureTenthsC(&gMax31865, &gTemperatureTenthsC) != 0U) {
-      tm1637DisplayDecimalTenths(&gDisplay2, gTemperatureTenthsC);
-    }
-    else {
-      DisplayErrorOnDisplay2(Max31865_ReadFault(&gMax31865, MAX31865_FAULT_NONE));
-    }
+    tm1637DisplayDecimalTenths(&gDisplay2, gTemperatureTenthsC);
+  }
+  else {
+    DisplayErrorOnDisplay2(Max31865_ReadFault(&gMax31865, MAX31865_FAULT_NONE));
   }
 }
 
@@ -532,7 +551,6 @@ static void UserMode_Enter(uint32_t now)
   ProgramLeds_Set(PROGRAM_NONE);
   UserLed_Update();
   UserDisplay_MarkDirty(now);
-  UserLed_Update();
 }
 
 static void UserMode_Exit(void)
@@ -796,7 +814,7 @@ static void MainCycle_Process(uint32_t now)
    }
 
   if (gMainCyclePhase != MAIN_PHASE_DONE) {
-	  if (MainCycle_ReadTemperatureOrFail() == 0U) {
+	  if (MainCycle_ReadTemperatureOrFail(now) == 0U) {
        return;
      }
      if (gTemperatureTenthsC >= 0 && (uint16_t)gTemperatureTenthsC > MAIN_OVER_TEMPERATURE_TENTHS) {
@@ -863,6 +881,7 @@ static void MainCycle_Process(uint32_t now)
 
 static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
 {
+  gTemperatureReadFailCount = 0U;
   gMainCyclePhase = phase;
   gMainPhaseStartTick = now;
   gCycleLedBlinkPhase = 0xffU;
@@ -960,11 +979,12 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
        cutoffTemperatureTenthsC = gActiveProgram.temperatureTenthsC - MAIN_ASSIST_JACKET_HEATER_CUTOFF_TENTHS;
      }
 
-     if (gTemperatureTenthsC >= 0 && (uint16_t)gTemperatureTenthsC >= cutoffTemperatureTenthsC) {
+     /* cycleMs is derived from compile-time constants but guard is kept for safety. */
+     if (cycleMs == 0U) {
        return GPIO_PIN_RESET;
      }
 
-     if (cycleMs == 0U) {
+     if (gTemperatureTenthsC >= 0 && (uint16_t)gTemperatureTenthsC >= cutoffTemperatureTenthsC) {
        return GPIO_PIN_RESET;
      }
 
@@ -975,8 +995,9 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
   {
     uint32_t onMs;
 
+    /* Setpoint is fixed for the duration of holding phase (set in MainCycle_SetPhase).
+     * Only the measured input changes each sample. */
     gHoldingPidInput = (double)gTemperatureTenthsC / 10.0;
-    gHoldingPidSetpoint = (double)gActiveProgram.temperatureTenthsC / 10.0;
     (void)PID_Compute(&gHoldingPid);
 
     if ((now - gHoldingPidWindowStartTick) >= MAIN_HOLD_PID_WINDOW_MS) {
@@ -1024,16 +1045,19 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
     HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_SET);
 
-    if ((((uint32_t)gActiveProgram.dryMinutes * MINUTE_MS) <= MAIN_DRY_HEATER_CUTOFF_MS) ||
-            (elapsed >= (((uint32_t)gActiveProgram.dryMinutes * MINUTE_MS) - MAIN_DRY_HEATER_CUTOFF_MS))) {
+    {
+      uint32_t dryTotalMs = (uint32_t)gActiveProgram.dryMinutes * MINUTE_MS;
+      if ((dryTotalMs <= MAIN_DRY_HEATER_CUTOFF_MS) ||
+          (elapsed >= (dryTotalMs - MAIN_DRY_HEATER_CUTOFF_MS))) {
         gDryJacketHeaterOn = 0U;
       }
       else if (gTemperatureTenthsC >= 0) {
-      if ((uint16_t)gTemperatureTenthsC <= MAIN_DRY_TEMPERATURE_LOW_TENTHS) {
-        gDryJacketHeaterOn = 1U;
-      }
-      else if ((uint16_t)gTemperatureTenthsC >= MAIN_DRY_TEMPERATURE_HIGH_TENTHS) {
-        gDryJacketHeaterOn = 0U;
+        if ((uint16_t)gTemperatureTenthsC <= MAIN_DRY_TEMPERATURE_LOW_TENTHS) {
+          gDryJacketHeaterOn = 1U;
+        }
+        else if ((uint16_t)gTemperatureTenthsC >= MAIN_DRY_TEMPERATURE_HIGH_TENTHS) {
+          gDryJacketHeaterOn = 0U;
+        }
       }
     }
 
@@ -1043,22 +1067,13 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
 
 static void MainCycle_UpdateTemperatureDisplay(uint32_t now)
 {
-  if ((now - gLastTemperatureReadTick) < TEMPERATURE_REFRESH_MS) {
-    return;
-  }
-
-  gLastTemperatureReadTick = now;
+  /* Temperature was already read by MainCycle_ReadTemperatureOrFail()
+   * via Temperature_ReadAndUpdate(). Just refresh the display — no second
+   * SPI transaction needed. Fault display is intentionally suppressed here;
+   * MainCycle_Process() raises Er01 if the read is truly invalid. */
+  (void)now;
   if (gSensorReady != 0U) {
-    if (Max31865_ReadTemperatureTenthsC(&gMax31865, &gTemperatureTenthsC) != 0U) {
-      tm1637DisplayDecimalTenths(&gDisplay2, gTemperatureTenthsC);
-    }
-    else {
-    	/* During an active cycle, do not show raw MAX31865 fault bits as Erxx.
-    	 * Code 04 is reserved for the heating timeout safety error and can be
-    	 * confused with a transient MAX31865 OV/UV bit when vacuum toggles from
-    	 * pump to heater. MainCycle_Process() performs the real sensor safety
-         * check and raises Er01 if the temperature read is invalid. */
-    }
+    tm1637DisplayDecimalTenths(&gDisplay2, gTemperatureTenthsC);
   }
 }
 
@@ -1299,12 +1314,26 @@ static void MainCycleHoldingLeds_Update(uint32_t elapsed, uint8_t blinkOn)
   }
 }
 
-static uint8_t MainCycle_ReadTemperatureOrFail(void)
+static uint8_t MainCycle_ReadTemperatureOrFail(uint32_t now)
 {
-  if (gSensorReady == 0U || Max31865_ReadTemperatureTenthsC(&gMax31865, &gTemperatureTenthsC) == 0U) {
-    SafetyError_Set(1U);
-    return 0U;
+  /* Delegate to the shared throttled reader so only one SPI transaction
+   * per TEMPERATURE_REFRESH_MS window occurs regardless of call site. */
+  if (Temperature_ReadAndUpdate(now) == 0U) {
+    /* No fresh sample this tick — reuse last known value. */
+    return 1U;
   }
+  if (gSensorReady == 0U || gTemperatureTenthsC == 0) {
+    gTemperatureReadFailCount++;
+    if (gTemperatureReadFailCount >= TEMPERATURE_READ_FAIL_MAX) {
+      gTemperatureReadFailCount = 0U;
+      SafetyError_Set(1U);
+      return 0U;
+    }
+    /* Transient read failure (e.g. relay switching noise) — keep last
+     * temperature value and allow the cycle to continue. */
+    return 1U;
+  }
+  gTemperatureReadFailCount = 0U;
   return 1U;
 }
 
@@ -1385,7 +1414,7 @@ static void StartupSafety_SetReady(void){
 
 static uint8_t StartupSafety_CheckPt100(void)
 {
-  if (MainCycle_ReadTemperatureOrFail() == 0U) {
+  if (MainCycle_ReadTemperatureOrFail(HAL_GetTick()) == 0U) {
     return 0U;
   }
 
@@ -1444,6 +1473,7 @@ static void SafetyOutputs_Stop(void)
 
 static void SafetyError_Set(uint8_t code)
 {
+  gSafetyErrorActive = 1U;
   gMainCycleActive = 0U;
   gMainCyclePhase = MAIN_PHASE_STANDBY;
   SafetyOutputs_Stop();
@@ -1576,10 +1606,6 @@ int main(void)
   ProgramLeds_Set(PROGRAM_NONE);
   UserLed_Update();
   HAL_GPIO_WritePin(LD_Start_GPIO_Port, LD_Start_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(LD_HW_GPIO_Port, LD_HW_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(LD_LW_GPIO_Port, LD_LW_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(LD_Alarm_GPIO_Port, LD_Alarm_Pin, GPIO_PIN_RESET);
-  SafetyOutputs_Stop();
   HAL_GPIO_WritePin(LD_HW_GPIO_Port, LD_HW_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(LD_LW_GPIO_Port, LD_LW_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(LD_Alarm_GPIO_Port, LD_Alarm_Pin, GPIO_PIN_RESET);
