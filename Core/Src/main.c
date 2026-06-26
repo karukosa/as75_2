@@ -131,7 +131,7 @@ typedef struct {
 #define MAIN_HOLD_PID_KI 0.18
 #define MAIN_HOLD_PID_KD 3.0
 #define MAIN_HOLD_PID_INITIAL_OUTPUT 96.0
-#define WATER_FILL_TIMEOUT_MS (3U * MINUTE_MS)
+#define WATER_FILL_TIMEOUT_MS (4U * MINUTE_MS)
 /* Temporary bypass so the cycle can be tested without the water sensor/check.
  * Set 0U to use real sensor*/
 #define WATER_CHECK_BYPASS_FOR_TEST 0U
@@ -139,6 +139,7 @@ typedef struct {
 #define MAIN_OVER_TEMPERATURE_TENTHS 1380U
 #define MAIN_CYCLE_LED_BLINK_MS 500U
 #define ACTIVE_CHANNEL_USER 0U
+#define TEMPERATURE_READ_FAIL_MAX 3U
 
 /* USER CODE END PD */
 
@@ -193,6 +194,7 @@ double gHoldingPidOutput = 0.0;
 double gHoldingPidSetpoint = 121.0;
 uint32_t gHoldingPidWindowStartTick = 0U;
 uint8_t gDryJacketHeaterOn = 0U;
+static uint8_t gTemperatureReadFailCount = 0U;
 
 static const ProgramConfig programPresets[PROGRAM_COUNT] = {
   {1210U, 15U, 0U}, {1210U, 20U, 15U}, {1320U, 7U, 10U},
@@ -863,6 +865,7 @@ static void MainCycle_Process(uint32_t now)
 
 static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
 {
+  gTemperatureReadFailCount = 0U;
   gMainCyclePhase = phase;
   gMainPhaseStartTick = now;
   gCycleLedBlinkPhase = 0xffU;
@@ -1302,9 +1305,16 @@ static void MainCycleHoldingLeds_Update(uint32_t elapsed, uint8_t blinkOn)
 static uint8_t MainCycle_ReadTemperatureOrFail(void)
 {
   if (gSensorReady == 0U || Max31865_ReadTemperatureTenthsC(&gMax31865, &gTemperatureTenthsC) == 0U) {
-    SafetyError_Set(1U);
-    return 0U;
+    gTemperatureReadFailCount++;
+    if (gTemperatureReadFailCount >= TEMPERATURE_READ_FAIL_MAX) {
+      gTemperatureReadFailCount = 0U;
+      SafetyError_Set(1U);
+      return 0U;
+    }
+    /* Transient read failure (e.g. relay switching noise) — keep last value. */
+    return 1U;
   }
+  gTemperatureReadFailCount = 0U;
   return 1U;
 }
 
@@ -1444,6 +1454,7 @@ static void SafetyOutputs_Stop(void)
 
 static void SafetyError_Set(uint8_t code)
 {
+  gSafetyErrorActive = 1U;
   gMainCycleActive = 0U;
   gMainCyclePhase = MAIN_PHASE_STANDBY;
   SafetyOutputs_Stop();
