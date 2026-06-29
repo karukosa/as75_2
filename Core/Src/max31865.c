@@ -1,4 +1,4 @@
-/*␊
+/*
  * max31865.c
  *
  *  Created on: Mar 25, 2026
@@ -10,6 +10,9 @@
 #include <math.h>
 
 #define MAX31865_WRITE_ADDR_MASK 0x80U
+#define MAX31865_READ_RETRY_COUNT 3U
+#define MAX31865_ONE_SHOT_DELAY_MS 100U
+#define MAX31865_FAULT_RECOVERY_DELAY_MS 10U
 
 static uint8_t max31865ReadRegisterN(Max31865Handle *handle, uint8_t addr, uint8_t *buffer, uint8_t n);
 static uint8_t max31865ReadRegister8(Max31865Handle *handle, uint8_t addr, uint8_t *value);
@@ -206,7 +209,7 @@ uint16_t Max31865_ReadRTD(Max31865Handle *handle)
         /* Chế độ one-shot cần kích chuyển đổi và chờ đủ thời gian lọc. */
         config |= MAX31865_CONFIG_1SHOT;
         (void)max31865WriteRegister8(handle, MAX31865_CONFIG_REG, config);
-        HAL_Delay(65U);
+        HAL_Delay(MAX31865_ONE_SHOT_DELAY_MS);
     }
     else {
         /* Auto-convert đã chạy nền, chỉ cần đồng bộ config/bias rồi đọc luôn. */
@@ -268,18 +271,32 @@ float Max31865_CalculateTemperature(uint16_t rawRtd, float rtdNominal, float ref
 uint8_t Max31865_ReadTemperatureC(Max31865Handle *handle, float *temperatureC)
 {
     uint16_t rawRtd;
+    uint8_t fault;
+    uint8_t attempt;
 
     if (handle == NULL || temperatureC == NULL) {
         return 0U;
     }
 
-    rawRtd = Max31865_ReadRTD(handle);
-    if (rawRtd == 0U && Max31865_ReadFault(handle, MAX31865_FAULT_NONE) != 0U) {
-       return 0U;
-    }
-    *temperatureC = Max31865_CalculateTemperature(rawRtd, handle->rNominalOhms, handle->rRefOhms);
+    for (attempt = 0U; attempt < MAX31865_READ_RETRY_COUNT; attempt++) {
+        rawRtd = Max31865_ReadRTD(handle);
+        fault = Max31865_ReadFault(handle, MAX31865_FAULT_NONE);
 
-    return 1U;
+        if (rawRtd != 0U && fault == 0U) {
+            *temperatureC = Max31865_CalculateTemperature(rawRtd,
+                                                          handle->rNominalOhms,
+                                                          handle->rRefOhms);
+            return 1U;
+        }
+
+        /* Relay/pump switching can momentarily set OV/UV or corrupt one SPI read.
+         * Clear the latch, let the analog front-end settle, then try again before
+         * reporting a real PT100 failure to the application. */
+        Max31865_ClearFault(handle);
+        HAL_Delay(MAX31865_FAULT_RECOVERY_DELAY_MS);
+    }
+
+    return 0U;
 }
 
 uint8_t Max31865_ReadTemperatureTenthsC(Max31865Handle *handle, int16_t *temperatureTenths)

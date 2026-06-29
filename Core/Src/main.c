@@ -119,7 +119,7 @@ typedef struct {
 #define MAIN_ASSIST_JACKET_HEATER_ON_MS 10000U
 #define MAIN_ASSIST_JACKET_HEATER_OFF_MS 10000U
 #define MAIN_ASSIST_JACKET_HEATER_CUTOFF_TENTHS 100U
-#define MAIN_EXHAUST_DRAIN_MS (2U * MINUTE_MS)
+#define MAIN_EXHAUST_DRAIN_MS (3U * MINUTE_MS)
 #define MAIN_EXHAUST_VACUUM_MS (3U * MINUTE_MS)
 #define MAIN_EXHAUST_MS (MAIN_EXHAUST_DRAIN_MS + MAIN_EXHAUST_VACUUM_MS)
 #define MAIN_DRY_TEMPERATURE_LOW_TENTHS 980U
@@ -139,7 +139,7 @@ typedef struct {
 #define MAIN_OVER_TEMPERATURE_TENTHS 1380U
 #define MAIN_CYCLE_LED_BLINK_MS 500U
 #define ACTIVE_CHANNEL_USER 0U
-#define TEMPERATURE_READ_FAIL_MAX 5U
+#define TEMPERATURE_READ_FAIL_MAX 20U
 
 /* USER CODE END PD */
 
@@ -534,7 +534,6 @@ static void UserMode_Enter(uint32_t now)
   ProgramLeds_Set(PROGRAM_NONE);
   UserLed_Update();
   UserDisplay_MarkDirty(now);
-  UserLed_Update();
 }
 
 static void UserMode_Exit(void)
@@ -906,7 +905,7 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
 
       case MAIN_PHASE_HEATING:
         HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_SET);
-        HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin, GPIO_PIN_SET);
         HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_RESET);
@@ -938,7 +937,7 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
     uint8_t heaterStep = ((subPhase & 0x01U) != 0U) ? 1U : 0U;
 
     HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin,
-                          (heaterStep == 0U) ? MainCycle_GetAssistJacketHeaterState(elapsed) : GPIO_PIN_RESET);
+                          (heaterStep != 0U) ? MainCycle_GetAssistJacketHeaterState(elapsed) : GPIO_PIN_RESET);
     HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_RESET);
 
@@ -1053,14 +1052,18 @@ static void MainCycle_UpdateTemperatureDisplay(uint32_t now)
   gLastTemperatureReadTick = now;
   if (gSensorReady != 0U) {
     if (Max31865_ReadTemperatureTenthsC(&gMax31865, &gTemperatureTenthsC) != 0U) {
+      gTemperatureReadFailCount = 0U;
       tm1637DisplayDecimalTenths(&gDisplay2, gTemperatureTenthsC);
     }
     else {
-    	/* During an active cycle, do not show raw MAX31865 fault bits as Erxx.
-    	 * Code 04 is reserved for the heating timeout safety error and can be
-    	 * confused with a transient MAX31865 OV/UV bit when vacuum toggles from
-    	 * pump to heater. MainCycle_Process() performs the real sensor safety
-         * check and raises Er01 if the temperature read is invalid. */
+      /* Read failed — could be transient relay switching noise.
+       * Count consecutive failures; only raise Er01 after TEMPERATURE_READ_FAIL_MAX.
+       * Keep displaying the last valid temperature in the meantime. */
+      gTemperatureReadFailCount++;
+      if (gTemperatureReadFailCount >= TEMPERATURE_READ_FAIL_MAX) {
+        gTemperatureReadFailCount = 0U;
+        SafetyError_Set(1U);
+      }
     }
   }
 }
@@ -1305,16 +1308,9 @@ static void MainCycleHoldingLeds_Update(uint32_t elapsed, uint8_t blinkOn)
 static uint8_t MainCycle_ReadTemperatureOrFail(void)
 {
   if (gSensorReady == 0U || Max31865_ReadTemperatureTenthsC(&gMax31865, &gTemperatureTenthsC) == 0U) {
-    gTemperatureReadFailCount++;
-    if (gTemperatureReadFailCount >= TEMPERATURE_READ_FAIL_MAX) {
-      gTemperatureReadFailCount = 0U;
-      SafetyError_Set(1U);
-      return 0U;
-    }
-    /* Transient read failure (e.g. relay switching noise) — keep last value. */
-    return 1U;
+    SafetyError_Set(1U);
+    return 0U;
   }
-  gTemperatureReadFailCount = 0U;
   return 1U;
 }
 
@@ -1594,7 +1590,6 @@ int main(void)
   HAL_GPIO_WritePin(LD_HW_GPIO_Port, LD_HW_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(LD_LW_GPIO_Port, LD_LW_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(LD_Alarm_GPIO_Port, LD_Alarm_Pin, GPIO_PIN_RESET);
-  SafetyOutputs_Stop();
 
   Max31865_Init(&gMax31865, &hspi3, CS_GPIO_Port, CS_Pin, 430.0f, 100.0f);
   gSensorReady = Max31865_Begin(&gMax31865, MAX31865_2WIRE, 1U);
@@ -1612,6 +1607,7 @@ int main(void)
     /* USER CODE BEGIN 3 */
     uint32_t now = HAL_GetTick();
     StartupSafety_Process(now);
+    WaterLeds_Update();
     StartButton_Process(now);
     ProgramButtons_Process(now);
     UserButtons_Process(now);
