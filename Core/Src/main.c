@@ -119,6 +119,7 @@ typedef struct {
 #define MAIN_ASSIST_JACKET_HEATER_ON_MS 10000U
 #define MAIN_ASSIST_JACKET_HEATER_OFF_MS 10000U
 #define MAIN_ASSIST_JACKET_HEATER_CUTOFF_TENTHS 100U
+#define MAIN_HEATING_RESISTOR_CUTOFF_TENTHS 150U
 #define MAIN_EXHAUST_DRAIN_MS (3U * MINUTE_MS)
 #define MAIN_EXHAUST_VACUUM_MS (2U * MINUTE_MS)
 #define MAIN_EXHAUST_MS (MAIN_EXHAUST_DRAIN_MS + MAIN_EXHAUST_VACUUM_MS)
@@ -904,13 +905,23 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
         break;
 
       case MAIN_PHASE_HEATING:
+      {
+        uint16_t resistorCutoffTemperatureTenthsC = 0U;
+
+        if (gActiveProgram.temperatureTenthsC > MAIN_HEATING_RESISTOR_CUTOFF_TENTHS) {
+        resistorCutoffTemperatureTenthsC = gActiveProgram.temperatureTenthsC - MAIN_HEATING_RESISTOR_CUTOFF_TENTHS;
+        }
+
         HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_SET);
-        HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin,
+                                 (gTemperatureTenthsC >= 0 &&
+                                 (uint16_t)gTemperatureTenthsC >= resistorCutoffTemperatureTenthsC) ? GPIO_PIN_RESET : GPIO_PIN_SET);
         HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(Relay_Valve2_GPIO_Port, Relay_Valve2_Pin, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_RESET);
         break;
+      }
 
       case MAIN_PHASE_HOLDING:
         MainCycle_UpdateHoldingOutputs(now);
