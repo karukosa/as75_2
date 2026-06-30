@@ -118,20 +118,21 @@ typedef struct {
 #define MAIN_VACUUM_STEP_MS (MAIN_VACUUM_MS / (MAIN_VACUUM_CYCLE_COUNT * 2U))
 #define MAIN_ASSIST_JACKET_HEATER_ON_MS 10000U
 #define MAIN_ASSIST_JACKET_HEATER_OFF_MS 10000U
-#define MAIN_ASSIST_JACKET_HEATER_CUTOFF_TENTHS 100U
-#define MAIN_HEATING_RESISTOR_CUTOFF_TENTHS 150U
+#define MAIN_ASSIST_JACKET_HEATER_CUTOFF_TENTHS 250U
+#define MAIN_HEATING_RESISTOR_CUTOFF_TENTHS 250U
 #define MAIN_EXHAUST_DRAIN_MS (3U * MINUTE_MS)
 #define MAIN_EXHAUST_VACUUM_MS (2U * MINUTE_MS)
 #define MAIN_EXHAUST_MS (MAIN_EXHAUST_DRAIN_MS + MAIN_EXHAUST_VACUUM_MS)
 #define MAIN_DRY_TEMPERATURE_LOW_TENTHS 1000U
 #define MAIN_DRY_TEMPERATURE_HIGH_TENTHS 1020U
 #define MAIN_DRY_HEATER_CUTOFF_MS (2U * MINUTE_MS)
-#define MAIN_HOLD_PID_WINDOW_MS 2000U
-#define MAIN_HOLD_PID_SAMPLE_MS 500U
-#define MAIN_HOLD_PID_KP 24.0
-#define MAIN_HOLD_PID_KI 0.18
-#define MAIN_HOLD_PID_KD 3.0
-#define MAIN_HOLD_PID_INITIAL_OUTPUT 96.0
+#define MAIN_HOLD_PID_WINDOW_MS 1000U
+#define MAIN_HOLD_PID_SAMPLE_MS 1000U
+#define MAIN_HOLD_PID_KP 10.0
+#define MAIN_HOLD_PID_KI 0.1
+#define MAIN_HOLD_PID_KD 5.0
+#define MAIN_HOLD_PID_INITIAL_OUTPUT 40.0
+#define MAIN_HOLD_PID_MAX_OUTPUT 180.0
 #define WATER_FILL_TIMEOUT_MS (4U * MINUTE_MS)
 /* Temporary bypass so the cycle can be tested without the water sensor/check.
  * Set 0U to use real sensor*/
@@ -878,7 +879,7 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
       gHoldingPidSetpoint = (double)gActiveProgram.temperatureTenthsC / 10.0;
       PID2(&gHoldingPid, &gHoldingPidInput, &gHoldingPidOutput, &gHoldingPidSetpoint,
     		  MAIN_HOLD_PID_KP, MAIN_HOLD_PID_KI, MAIN_HOLD_PID_KD, _PID_CD_DIRECT);
-      PID_SetOutputLimits(&gHoldingPid, 0.0, 255.0);
+      PID_SetOutputLimits(&gHoldingPid, 0.0, MAIN_HOLD_PID_MAX_OUTPUT );
       PID_SetSampleTime(&gHoldingPid, MAIN_HOLD_PID_SAMPLE_MS);
       PID_SetMode(&gHoldingPid, _PID_MODE_AUTOMATIC);
       gHoldingPidWindowStartTick = now;
