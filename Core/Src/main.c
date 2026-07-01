@@ -128,11 +128,11 @@ typedef struct {
 #define MAIN_DRY_HEATER_CUTOFF_MS (2U * MINUTE_MS)
 #define MAIN_HOLD_PID_WINDOW_MS 1000U
 #define MAIN_HOLD_PID_SAMPLE_MS 1000U
-#define MAIN_HOLD_PID_KP 10.0
-#define MAIN_HOLD_PID_KI 0.1
-#define MAIN_HOLD_PID_KD 5.0
+#define MAIN_HOLD_PID_KP 5.0
+#define MAIN_HOLD_PID_KI 0.5
+#define MAIN_HOLD_PID_KD 3.0
 #define MAIN_HOLD_PID_INITIAL_OUTPUT 40.0
-#define MAIN_HOLD_PID_MAX_OUTPUT 255.0
+#define MAIN_HOLD_PID_MAX_OUTPUT 200.0
 #define WATER_FILL_TIMEOUT_MS (4U * MINUTE_MS)
 /* Temporary bypass so the cycle can be tested without the water sensor/check.
  * Set 0U to use real sensor*/
