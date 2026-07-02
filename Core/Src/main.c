@@ -117,7 +117,7 @@ typedef struct {
 #define MAIN_VACUUM_CYCLE_COUNT 3U
 #define MAIN_VACUUM_STEP_MS (MAIN_VACUUM_MS / (MAIN_VACUUM_CYCLE_COUNT * 2U))
 #define MAIN_ASSIST_JACKET_HEATER_ON_MS 10000U
-#define MAIN_ASSIST_JACKET_HEATER_OFF_MS 100l00U
+#define MAIN_ASSIST_JACKET_HEATER_OFF_MS 10000U
 #define MAIN_ASSIST_JACKET_HEATER_CUTOFF_TENTHS 250U
 #define MAIN_HEATING_RESISTOR_CUTOFF_TENTHS 250U
 #define MAIN_EXHAUST_DRAIN_MS (3U * MINUTE_MS)
@@ -129,10 +129,10 @@ typedef struct {
 #define MAIN_HOLD_PID_WINDOW_MS 1000U
 #define MAIN_HOLD_PID_SAMPLE_MS 1000U
 #define MAIN_HOLD_PID_KP 5.0
-#define MAIN_HOLD_PID_KI 0.5
-#define MAIN_HOLD_PID_KD 3.0
+#define MAIN_HOLD_PID_KI 0.6
+#define MAIN_HOLD_PID_KD 4.0
 #define MAIN_HOLD_PID_INITIAL_OUTPUT 40.0
-#define MAIN_HOLD_PID_MAX_OUTPUT 200.0
+#define MAIN_HOLD_PID_MAX_OUTPUT 255.0
 #define WATER_FILL_TIMEOUT_MS (4U * MINUTE_MS)
 /* Temporary bypass so the cycle can be tested without the water sensor/check.
  * Set 0U to use real sensor*/
@@ -142,6 +142,9 @@ typedef struct {
 #define MAIN_CYCLE_LED_BLINK_MS 500U
 #define ACTIVE_CHANNEL_USER 0U
 #define TEMPERATURE_READ_FAIL_MAX 20U
+#define TEMPERATURE_FILTER_ALPHA_NUMERATOR 1
+#define TEMPERATURE_FILTER_ALPHA_DENOMINATOR 4
+#define TEMPERATURE_FILTER_MAX_STEP_TENTHS 50
 
 /* USER CODE END PD */
 
@@ -197,6 +200,8 @@ double gHoldingPidSetpoint = 121.0;
 uint32_t gHoldingPidWindowStartTick = 0U;
 uint8_t gDryJacketHeaterOn = 0U;
 static uint8_t gTemperatureReadFailCount = 0U;
+static uint8_t gTemperatureFilterReady = 0U;
+static int16_t gFilteredTemperatureTenthsC = 0;
 
 static const ProgramConfig programPresets[PROGRAM_COUNT] = {
   {1210U, 15U, 0U}, {1210U, 20U, 15U}, {1320U, 7U, 10U},
@@ -264,6 +269,8 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now);
 static void MainCycle_ApplyOutputs(uint32_t now);
 static void MainCycle_UpdateVacuumOutputs(uint32_t elapsed);
 static GPIO_PinState MainCycle_GetAssistJacketHeaterState(uint32_t elapsed);
+static void MainCycle_StartPidControl(uint32_t now);
+static void MainCycle_UpdatePidHeaterOutput(uint32_t now);
 static void MainCycle_UpdateHoldingOutputs(uint32_t now);
 static void MainCycle_UpdateExhaustOutputs(uint32_t elapsed);
 static void MainCycle_UpdateDryingOutputs(uint32_t elapsed);
@@ -281,6 +288,9 @@ static void MainCycleHoldingLeds_Update(uint32_t elapsed, uint8_t blinkOn);
 static uint8_t MainCycle_ReadTemperatureOrFail(void);
 static uint8_t DoorSwitch_IsClosed(void);
 static uint8_t MainCycle_CheckDoorOrFail(void);
+static uint8_t Temperature_ReadFilteredTenthsC(int16_t *temperatureTenths);
+static int16_t TemperatureFilter_Apply(int16_t rawTemperatureTenths);
+static void TemperatureFilter_Reset(void);
 static void StartupSafety_Init(uint32_t now);
 static void StartupSafety_Process(uint32_t now);
 static uint8_t StartupSafety_IsReady(void);
@@ -449,7 +459,7 @@ static void TemperatureDisplay_Process(uint32_t now)
   }
 
   if (gSensorReady != 0U) {
-    if (Max31865_ReadTemperatureTenthsC(&gMax31865, &gTemperatureTenthsC) != 0U) {
+	  if (Temperature_ReadFilteredTenthsC(&gTemperatureTenthsC) != 0U) {
       tm1637DisplayDecimalTenths(&gDisplay2, gTemperatureTenthsC);
     }
     else {
@@ -873,16 +883,8 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
   gCycleLedBlinkTick = now;
   gMainDisplayPhase = MAIN_PHASE_STANDBY;
   gMainDisplayValue = 0xffffU;
-  if (phase == MAIN_PHASE_HOLDING) {
-      gHoldingPidInput = (double)gTemperatureTenthsC / 10.0;
-      gHoldingPidOutput = MAIN_HOLD_PID_INITIAL_OUTPUT;
-      gHoldingPidSetpoint = (double)gActiveProgram.temperatureTenthsC / 10.0;
-      PID2(&gHoldingPid, &gHoldingPidInput, &gHoldingPidOutput, &gHoldingPidSetpoint,
-    		  MAIN_HOLD_PID_KP, MAIN_HOLD_PID_KI, MAIN_HOLD_PID_KD, _PID_CD_DIRECT);
-      PID_SetOutputLimits(&gHoldingPid, 0.0, MAIN_HOLD_PID_MAX_OUTPUT );
-      PID_SetSampleTime(&gHoldingPid, MAIN_HOLD_PID_SAMPLE_MS);
-      PID_SetMode(&gHoldingPid, _PID_MODE_AUTOMATIC);
-      gHoldingPidWindowStartTick = now;
+  if (phase == MAIN_PHASE_HEATING || phase == MAIN_PHASE_HOLDING) {
+        MainCycle_StartPidControl(now);
     }
     else {
       PID_SetMode(&gHoldingPid, _PID_MODE_MANUAL);
@@ -913,7 +915,7 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
         resistorCutoffTemperatureTenthsC = gActiveProgram.temperatureTenthsC - MAIN_HEATING_RESISTOR_CUTOFF_TENTHS;
         }
 
-        HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin, GPIO_PIN_SET);
+        MainCycle_UpdatePidHeaterOutput(now);
         HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin,
                                  (gTemperatureTenthsC >= 0 &&
                                  (uint16_t)gTemperatureTenthsC >= resistorCutoffTemperatureTenthsC) ? GPIO_PIN_RESET : GPIO_PIN_SET);
@@ -985,7 +987,20 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
      return ((elapsed % cycleMs) < MAIN_ASSIST_JACKET_HEATER_ON_MS) ? GPIO_PIN_SET : GPIO_PIN_RESET;
    }
 
-  static void MainCycle_UpdateHoldingOutputs(uint32_t now)
+  static void MainCycle_StartPidControl(uint32_t now)
+    {
+      gHoldingPidInput = (double)gTemperatureTenthsC / 10.0;
+      gHoldingPidOutput = MAIN_HOLD_PID_INITIAL_OUTPUT;
+      gHoldingPidSetpoint = (double)gActiveProgram.temperatureTenthsC / 10.0;
+      PID2(&gHoldingPid, &gHoldingPidInput, &gHoldingPidOutput, &gHoldingPidSetpoint,
+           MAIN_HOLD_PID_KP, MAIN_HOLD_PID_KI, MAIN_HOLD_PID_KD, _PID_CD_DIRECT);
+      PID_SetOutputLimits(&gHoldingPid, 0.0, MAIN_HOLD_PID_MAX_OUTPUT);
+      PID_SetSampleTime(&gHoldingPid, MAIN_HOLD_PID_SAMPLE_MS);
+      PID_SetMode(&gHoldingPid, _PID_MODE_AUTOMATIC);
+      gHoldingPidWindowStartTick = now;
+    }
+
+    static void MainCycle_UpdatePidHeaterOutput(uint32_t now)
   {
     uint32_t onMs;
 
@@ -1003,6 +1018,11 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
     onMs = (uint32_t)((gHoldingPidOutput * (double)MAIN_HOLD_PID_WINDOW_MS) / 255.0);
     HAL_GPIO_WritePin(SSR_Heater_GPIO_Port, SSR_Heater_Pin,
                       ((now - gHoldingPidWindowStartTick) < onMs) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  }
+
+   static void MainCycle_UpdateHoldingOutputs(uint32_t now)
+   {
+    MainCycle_UpdatePidHeaterOutput(now);
     HAL_GPIO_WritePin(SSR_HResistor_GPIO_Port, SSR_HResistor_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(Relay_Pump_GPIO_Port, Relay_Pump_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_RESET);
@@ -1063,7 +1083,7 @@ static void MainCycle_UpdateTemperatureDisplay(uint32_t now)
 
   gLastTemperatureReadTick = now;
   if (gSensorReady != 0U) {
-    if (Max31865_ReadTemperatureTenthsC(&gMax31865, &gTemperatureTenthsC) != 0U) {
+	  if (Temperature_ReadFilteredTenthsC(&gTemperatureTenthsC) != 0U) {
       gTemperatureReadFailCount = 0U;
       tm1637DisplayDecimalTenths(&gDisplay2, gTemperatureTenthsC);
     }
@@ -1319,11 +1339,59 @@ static void MainCycleHoldingLeds_Update(uint32_t elapsed, uint8_t blinkOn)
 
 static uint8_t MainCycle_ReadTemperatureOrFail(void)
 {
-  if (gSensorReady == 0U || Max31865_ReadTemperatureTenthsC(&gMax31865, &gTemperatureTenthsC) == 0U) {
+	if (gSensorReady == 0U || Temperature_ReadFilteredTenthsC(&gTemperatureTenthsC) == 0U) {
     SafetyError_Set(1U);
     return 0U;
   }
   return 1U;
+}
+
+static uint8_t Temperature_ReadFilteredTenthsC(int16_t *temperatureTenths)
+{
+  int16_t rawTemperatureTenths;
+
+  if (temperatureTenths == NULL) {
+    return 0U;
+  }
+
+  if (Max31865_ReadTemperatureTenthsC(&gMax31865, &rawTemperatureTenths) == 0U) {
+    return 0U;
+  }
+
+  *temperatureTenths = TemperatureFilter_Apply(rawTemperatureTenths);
+  return 1U;
+}
+
+static int16_t TemperatureFilter_Apply(int16_t rawTemperatureTenths)
+{
+  int32_t delta;
+  int32_t filteredTemperature;
+
+  if (gTemperatureFilterReady == 0U) {
+    gFilteredTemperatureTenthsC = rawTemperatureTenths;
+    gTemperatureFilterReady = 1U;
+    return gFilteredTemperatureTenthsC;
+  }
+
+  delta = (int32_t)rawTemperatureTenths - (int32_t)gFilteredTemperatureTenthsC;
+  if (delta > TEMPERATURE_FILTER_MAX_STEP_TENTHS) {
+    delta = TEMPERATURE_FILTER_MAX_STEP_TENTHS;
+  }
+  else if (delta < -(int32_t)TEMPERATURE_FILTER_MAX_STEP_TENTHS) {
+    delta = -(int32_t)TEMPERATURE_FILTER_MAX_STEP_TENTHS;
+  }
+
+  filteredTemperature = (int32_t)gFilteredTemperatureTenthsC +
+      ((delta * TEMPERATURE_FILTER_ALPHA_NUMERATOR) / TEMPERATURE_FILTER_ALPHA_DENOMINATOR);
+  gFilteredTemperatureTenthsC = (int16_t)filteredTemperature;
+
+  return gFilteredTemperatureTenthsC;
+}
+
+static void TemperatureFilter_Reset(void)
+{
+  gTemperatureFilterReady = 0U;
+  gFilteredTemperatureTenthsC = 0;
 }
 
 static uint8_t DoorSwitch_IsClosed(void)
@@ -1604,6 +1672,7 @@ int main(void)
   HAL_GPIO_WritePin(LD_Alarm_GPIO_Port, LD_Alarm_Pin, GPIO_PIN_RESET);
 
   Max31865_Init(&gMax31865, &hspi3, CS_GPIO_Port, CS_Pin, 430.0f, 100.0f);
+  TemperatureFilter_Reset();
   gSensorReady = Max31865_Begin(&gMax31865, MAX31865_2WIRE, 1U);
   StartupSafety_Init(HAL_GetTick());
 

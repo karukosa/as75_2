@@ -13,6 +13,7 @@
 #define MAX31865_READ_RETRY_COUNT 3U
 #define MAX31865_ONE_SHOT_DELAY_MS 100U
 #define MAX31865_FAULT_RECOVERY_DELAY_MS 10U
+#define MAX31865_TEMPERATURE_OFFSET_C (-5.0f)
 
 static uint8_t max31865ReadRegisterN(Max31865Handle *handle, uint8_t addr, uint8_t *buffer, uint8_t n);
 static uint8_t max31865ReadRegister8(Max31865Handle *handle, uint8_t addr, uint8_t *value);
@@ -285,7 +286,7 @@ uint8_t Max31865_ReadTemperatureC(Max31865Handle *handle, float *temperatureC)
         if (rawRtd != 0U && fault == 0U) {
             *temperatureC = Max31865_CalculateTemperature(rawRtd,
                                                           handle->rNominalOhms,
-                                                          handle->rRefOhms);
+                                                          handle->rRefOhms) + MAX31865_TEMPERATURE_OFFSET_C;
             return 1U;
         }
 
