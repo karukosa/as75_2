@@ -127,10 +127,10 @@ typedef struct {
 #define MAIN_DRY_TEMPERATURE_HIGH_TENTHS 1020U
 #define MAIN_DRY_HEATER_CUTOFF_MS (2U * MINUTE_MS)
 #define MAIN_HOLD_PID_WINDOW_MS 1000U
-#define MAIN_HOLD_PID_SAMPLE_MS 1000U
-#define MAIN_HOLD_PID_KP 5.0
+#define MAIN_HOLD_PID_SAMPLE_MS 200U
+#define MAIN_HOLD_PID_KP 15.0
 #define MAIN_HOLD_PID_KI 0.6
-#define MAIN_HOLD_PID_KD 4.0
+#define MAIN_HOLD_PID_KD 6.0
 #define MAIN_HOLD_PID_INITIAL_OUTPUT 40.0
 #define MAIN_HOLD_PID_MAX_OUTPUT 255.0
 #define WATER_FILL_TIMEOUT_MS (4U * MINUTE_MS)
@@ -294,6 +294,7 @@ static void TemperatureFilter_Reset(void);
 static void StartupSafety_Init(uint32_t now);
 static void StartupSafety_Process(uint32_t now);
 static uint8_t StartupSafety_IsReady(void);
+static void StartupSafety_RequestRecheck(uint32_t now);
 static void StartupSafety_SetReady(void);
 static uint8_t StartupSafety_CheckPt100(void);
 static uint8_t MainCycle_CheckStartConditions(uint32_t now);
@@ -706,6 +707,7 @@ static void StartButton_Process(uint32_t now)
 	uint8_t completed = (gMainCyclePhase == MAIN_PHASE_DONE) ? 1U : 0U;
     MainCycle_Stop();
     if (completed != 0U) {
+      StartupSafety_RequestRecheck(now);
       MainCycle_RecallLastRun();
     }
     else {
@@ -1460,6 +1462,13 @@ static uint8_t StartupSafety_IsReady(void)
   return (gStartupSafetyState == STARTUP_SAFETY_READY) ? 1U : 0U;
 }
 
+static void StartupSafety_RequestRecheck(uint32_t now)
+{
+  gStartupSafetyState = STARTUP_SAFETY_CHECK_PT100;
+  gStartupSafetyStartTick = now;
+  StartupSafety_Process(now);
+}
+
 static void StartupSafety_SetReady(void){
 
   SafetyOutputs_Stop();
@@ -1486,13 +1495,16 @@ static uint8_t StartupSafety_CheckPt100(void)
 
 static uint8_t MainCycle_CheckStartConditions(uint32_t now)
 {
-  (void)now;
-
   SafetyOutputs_Stop();
 
   if (MainCycle_CheckDoorOrFail() == 0U) {
     return 0U;
   }
+
+  if (WaterSensor_HasWater() == 0U) {
+      StartupSafety_RequestRecheck(now);
+      return 0U;
+    }
 
   return 1U;
 }
