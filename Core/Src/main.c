@@ -127,12 +127,19 @@ typedef struct {
 #define MAIN_DRY_TEMPERATURE_HIGH_TENTHS 1020U
 #define MAIN_DRY_HEATER_CUTOFF_MS (2U * MINUTE_MS)
 #define MAIN_HOLD_PID_WINDOW_MS 1000U
-#define MAIN_HOLD_PID_SAMPLE_MS 200U
-#define MAIN_HOLD_PID_KP 15.0
-#define MAIN_HOLD_PID_KI 0.6
-#define MAIN_HOLD_PID_KD 6.0
-#define MAIN_HOLD_PID_INITIAL_OUTPUT 40.0
+#define MAIN_HOLD_PID_SAMPLE_MS 100U
+#define MAIN_HOLD_PID_KP 10.0
+#define MAIN_HOLD_PID_KI 1.0
+#define MAIN_HOLD_PID_KD 4.0
+#define MAIN_HOLD_PID_INITIAL_OUTPUT 90.0
 #define MAIN_HOLD_PID_MAX_OUTPUT 255.0
+#define MAIN_HOLD_PID_RECOVERY_ERROR_TENTHS 2
+#define MAIN_HOLD_PID_RECOVERY_MIN_OUTPUT 96.0
+#define MAIN_HOLD_PID_RECOVERY_BOOST_ERROR_TENTHS 10
+#define MAIN_HOLD_PID_RECOVERY_BOOST_OUTPUT 200.0
+#define MAIN_HOLD_PID_OVERSHOOT_ERROR_TENTHS 2
+#define MAIN_HOLD_PID_OVERSHOOT_BOOST_ERROR_TENTHS 10
+#define MAIN_HOLD_PID_OVERSHOOT_OUTPUT 0.0
 #define WATER_FILL_TIMEOUT_MS (4U * MINUTE_MS)
 /* Temporary bypass so the cycle can be tested without the water sensor/check.
  * Set 0U to use real sensor*/
@@ -1010,6 +1017,33 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
     gHoldingPidSetpoint = (double)gActiveProgram.temperatureTenthsC / 10.0;
     (void)PID_Compute(&gHoldingPid);
 
+    /* Act immediately when temperature leaves the setpoint band in either direction.
+         * Below setpoint, force a minimum heater duty; above setpoint, force heater off
+         * and bleed the integral term so residual PID output cannot keep heating. */
+        if (gTemperatureTenthsC >= 0) {
+          int16_t errorTenths = (int16_t)gActiveProgram.temperatureTenthsC - gTemperatureTenthsC;
+
+          if (errorTenths <= -MAIN_HOLD_PID_OVERSHOOT_BOOST_ERROR_TENTHS) {
+            gHoldingPidOutput = MAIN_HOLD_PID_OVERSHOOT_OUTPUT;
+            gHoldingPid.OutputSum = MAIN_HOLD_PID_OVERSHOOT_OUTPUT;
+          }
+          else if (errorTenths <= -MAIN_HOLD_PID_OVERSHOOT_ERROR_TENTHS &&
+                   gHoldingPidOutput > MAIN_HOLD_PID_OVERSHOOT_OUTPUT) {
+            gHoldingPidOutput = MAIN_HOLD_PID_OVERSHOOT_OUTPUT;
+            if (gHoldingPid.OutputSum > MAIN_HOLD_PID_OVERSHOOT_OUTPUT) {
+              gHoldingPid.OutputSum = MAIN_HOLD_PID_OVERSHOOT_OUTPUT;
+            }
+          }
+          else if (errorTenths >= MAIN_HOLD_PID_RECOVERY_BOOST_ERROR_TENTHS &&
+                   gHoldingPidOutput < MAIN_HOLD_PID_RECOVERY_BOOST_OUTPUT) {
+            gHoldingPidOutput = MAIN_HOLD_PID_RECOVERY_BOOST_OUTPUT;
+          }
+          else if (errorTenths >= MAIN_HOLD_PID_RECOVERY_ERROR_TENTHS &&
+                   gHoldingPidOutput < MAIN_HOLD_PID_RECOVERY_MIN_OUTPUT) {
+            gHoldingPidOutput = MAIN_HOLD_PID_RECOVERY_MIN_OUTPUT;
+          }
+        }
+
     if ((now - gHoldingPidWindowStartTick) >= MAIN_HOLD_PID_WINDOW_MS) {
       gHoldingPidWindowStartTick += MAIN_HOLD_PID_WINDOW_MS;
       if ((now - gHoldingPidWindowStartTick) >= MAIN_HOLD_PID_WINDOW_MS) {
@@ -1546,6 +1580,7 @@ static void SafetyError_Set(uint8_t code)
   gMainCycleActive = 0U;
   gMainCyclePhase = MAIN_PHASE_STANDBY;
   SafetyOutputs_Stop();
+  HAL_GPIO_WritePin(Relay_Valve3_GPIO_Port, Relay_Valve3_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(LD_Start_GPIO_Port, LD_Start_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(LD_Alarm_GPIO_Port, LD_Alarm_Pin, GPIO_PIN_SET);
   DisplayErrorOnDisplay2(code);
