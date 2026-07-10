@@ -1480,6 +1480,7 @@ static void StartupSafety_Process(uint32_t now)
   }
 
   if (WaterSensor_HasWater() != 0U) {
+	HAL_Delay(5000U);
     StartupSafety_SetReady();
   }
   else if ((now - gStartupSafetyStartTick) >= WATER_FILL_TIMEOUT_MS) {
