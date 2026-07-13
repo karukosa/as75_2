@@ -131,6 +131,7 @@ typedef struct {
 #define MAIN_HOLD_PID_KP 10.0
 #define MAIN_HOLD_PID_KI 1.0
 #define MAIN_HOLD_PID_KD 4.0
+#define MAIN_HEAT_PID_KI 0.0
 #define MAIN_HOLD_PID_INITIAL_OUTPUT 90.0
 #define MAIN_HOLD_PID_MAX_OUTPUT 255.0
 #define MAIN_HOLD_PID_RECOVERY_ERROR_TENTHS 2
@@ -212,7 +213,7 @@ static int16_t gFilteredTemperatureTenthsC = 0;
 
 static const ProgramConfig programPresets[PROGRAM_COUNT] = {
   {1210U, 15U, 0U}, {1210U, 20U, 15U}, {1320U, 7U, 10U},
-  {1340U, 7U, 10U}, {1340U, 10U, 20U}, {1340U, 5U, 5U}
+  {1340U, 7U, 10U}, {1340U, 10U, 20U}, {1340U, 7U, 5U}
 };
 
 static const GpioOutput programLeds[PROGRAM_COUNT] = {
@@ -998,11 +999,17 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
 
   static void MainCycle_StartPidControl(uint32_t now)
     {
+      /* Ki=0 during HEATING avoids integral windup while ramping up from a
+       * large initial error; the full Ki is only used once HOLDING begins,
+       * where it corrects the small steady-state error needed to keep
+       * temperature pinned at setpoint. */
+      double ki = (gMainCyclePhase == MAIN_PHASE_HOLDING) ? MAIN_HOLD_PID_KI : MAIN_HEAT_PID_KI;
+
       gHoldingPidInput = (double)gTemperatureTenthsC / 10.0;
       gHoldingPidOutput = MAIN_HOLD_PID_INITIAL_OUTPUT;
       gHoldingPidSetpoint = (double)gActiveProgram.temperatureTenthsC / 10.0;
       PID2(&gHoldingPid, &gHoldingPidInput, &gHoldingPidOutput, &gHoldingPidSetpoint,
-           MAIN_HOLD_PID_KP, MAIN_HOLD_PID_KI, MAIN_HOLD_PID_KD, _PID_CD_DIRECT);
+           MAIN_HOLD_PID_KP, ki, MAIN_HOLD_PID_KD, _PID_CD_DIRECT);
       PID_SetOutputLimits(&gHoldingPid, 0.0, MAIN_HOLD_PID_MAX_OUTPUT);
       PID_SetSampleTime(&gHoldingPid, MAIN_HOLD_PID_SAMPLE_MS);
       PID_SetMode(&gHoldingPid, _PID_MODE_AUTOMATIC);
@@ -1019,8 +1026,13 @@ static void MainCycle_SetPhase(MainCyclePhase phase, uint32_t now)
 
     /* Act immediately when temperature leaves the setpoint band in either direction.
          * Below setpoint, force a minimum heater duty; above setpoint, force heater off
-         * and bleed the integral term so residual PID output cannot keep heating. */
-        if (gTemperatureTenthsC >= 0) {
+         * and bleed the integral term so residual PID output cannot keep heating.
+         * Only applies during HOLDING: this is meant to react to small disturbances
+         * around an already-reached setpoint. During HEATING the ramp-up should be
+         * left to the plain P+D output (Ki=0, see MainCycle_StartPidControl) so it
+         * can taper off on its own before reaching the setpoint instead of being
+         * forced to a floor duty. */
+        if (gMainCyclePhase == MAIN_PHASE_HOLDING && gTemperatureTenthsC >= 0) {
           int16_t errorTenths = (int16_t)gActiveProgram.temperatureTenthsC - gTemperatureTenthsC;
 
           if (errorTenths <= -MAIN_HOLD_PID_OVERSHOOT_BOOST_ERROR_TENTHS) {
@@ -1480,6 +1492,7 @@ static void StartupSafety_Process(uint32_t now)
   }
 
   if (WaterSensor_HasWater() != 0U) {
+    HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_SET);
 	HAL_Delay(5000U);
     StartupSafety_SetReady();
   }
