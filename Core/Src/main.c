@@ -1492,6 +1492,7 @@ static void StartupSafety_Process(uint32_t now)
   }
 
   if (WaterSensor_HasWater() != 0U) {
+    HAL_GPIO_WritePin(Relay_Valve1_GPIO_Port, Relay_Valve1_Pin, GPIO_PIN_SET);
 	HAL_Delay(5000U);
     StartupSafety_SetReady();
   }
